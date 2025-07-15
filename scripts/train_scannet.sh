@@ -18,14 +18,15 @@
 # -r 2 : We use half-resolution data for training.
 
 # ============== [10 scenes] ==============
-scan_list=("scene0000_00" "scene0062_00" "scene0070_00" "scene0097_00" "scene0140_00" \
-"scene0200_00" "scene0347_00" "scene0400_00" "scene0590_00" "scene0645_00")
+# scan_list=("scene0000_00" "scene0062_00" "scene0070_00" "scene0097_00" "scene0140_00" \
+# "scene0200_00" "scene0347_00" "scene0400_00" "scene0590_00" "scene0645_00")
+scan_list=("scene0062_00")
 
-gpu_num=3     # change!
+gpu_num=0     # change!
 for scan in "${scan_list[@]}"; do
     echo "Training for ${scan} ....."
-    CUDA_VISIBLE_DEVICES=$gpu_num python train.py --port 601$gpu_num \
-        -s /gdata/cold1/wuyanmin/OpenGaussian/data/onedrive/scannet/${scan} \
+    CUDA_VISIBLE_DEVICES=$gpu_num python3 train.py --port 601$gpu_num \
+        -s ./datasets/scans/${scan} \
         -r 2 \
         --frozen_init_pts \
         --iterations 90_000 \

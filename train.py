@@ -28,7 +28,6 @@ from os import makedirs
 import torchvision
 import numpy as np
 from utils.sh_utils import RGB2SH
-import math
 # import faiss
 from scene.kmeans_quantize import Quantize_kMeans
 from bitarray import bitarray
@@ -155,7 +154,7 @@ def separation_loss(feat_mean_stack, iteration):
     return loss
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, \
-             checkpoint, debug_from):
+             checkpoint, debug_from, enable_multiview_refinement=False):
     iterations = [opt.start_ins_feat_iter, opt.start_leaf_cb_iter, opt.start_root_cb_iter]
     saving_iterations.extend(iterations)
     checkpoint_iterations.extend(iterations)
@@ -301,7 +300,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                           cluster_indices=cluster_indices, mode=cb_mode,
                                           root_num=opt.root_node_num, leaf_num=opt.leaf_node_num,
                                           sam_level=opt.sam_level,
-                                          save_memory=opt.save_memory)
+                                          save_memory=opt.save_memory,
+                                          enable_multiview_refinement=enable_multiview_refinement)
                 if not viewpoint_cam.data_on_gpu:
                     viewpoint_cam.to_gpu()
                 if cb_mode == "leaf":
@@ -534,8 +534,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save .ply
-            # training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), \
-            #     testing_iterations, opt.start_root_cb_iter, scene, render, (pipe, background, iteration))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), \
+                testing_iterations, opt.start_root_cb_iter, scene, render, (pipe, background, iteration))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 sys.stdout.flush()
@@ -621,7 +621,8 @@ def construct_pseudo_ins_feat(scene : Scene, renderFunc, renderArgs,
                             mode="root",            # root, leaf, lang
                             root_num=64, leaf_num=10,   # k1, k2
                             sam_level=3,
-                            save_memory=False):
+                            save_memory=False,
+                            enable_multiview_refinement=False):
     torch.cuda.empty_cache()
     # ##############################################################################################
     # [Stage 2.1, 2.2] Render all training views once to construct pseudo-instance feature labels. #
@@ -629,6 +630,47 @@ def construct_pseudo_ins_feat(scene : Scene, renderFunc, renderArgs,
     #   - view.pesudo_mask_bool [num_mask, H, W]                                                   #
     # ##############################################################################################
     sorted_train_cameras = sorted(scene.getTrainCameras(), key=lambda Camera: Camera.image_name)
+    
+    # ##############################################################################################
+    # Multi-view SAM mask refinement - Apply before processing individual views                    #
+    # ##############################################################################################
+    from utils.sam_refinement_utils import MultiViewSAMMaskRefiner
+    if enable_multiview_refinement and mode in ["root", "leaf"]:  # Only apply refinement in these stages
+        print("Applying multi-view SAM mask refinement...")
+        
+        # Collect original SAM masks from all cameras
+        original_sam_masks = []
+        cameras_to_refine = []
+        
+        for view in sorted_train_cameras:
+            if not view.data_on_gpu:
+                view.to_gpu()
+            if view.original_sam_mask is not None:
+                original_sam_masks.append(view.original_sam_mask.cuda())
+                cameras_to_refine.append(view)
+            else:
+                original_sam_masks.append(None)
+                cameras_to_refine.append(view)
+        
+        # Apply multi-view refinement
+        refiner = MultiViewSAMMaskRefiner(overlap_threshold=0.3, consensus_strategy="majority_vote")
+        refined_sam_masks = refiner.refine_sam_masks(
+            cameras_to_refine, 
+            original_sam_masks, 
+            scene.gaussians, 
+            sam_level=sam_level
+        )
+        
+        # Update cameras with refined masks
+        for i, view in enumerate(sorted_train_cameras):
+            if refined_sam_masks[i] is not None:
+                view.original_sam_mask = refined_sam_masks[i]
+                
+        print("Multi-view SAM mask refinement completed")
+    # ##############################################################################################
+    # END refinenemt                                                                               #
+    # ##############################################################################################
+    
     for idx, view in enumerate(tqdm(sorted_train_cameras, desc="construt pseudo feat")):
         if not view.data_on_gpu:
             view.to_gpu()
@@ -997,6 +1039,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--enable_multiview_sam_refinement", action="store_true", default=False, 
+                       help="Enable multi-view SAM mask refinement for consistency")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     args.checkpoint_iterations.append(args.iterations)
@@ -1011,7 +1055,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), \
              args.test_iterations, args.save_iterations, args.checkpoint_iterations, \
-             args.start_checkpoint, args.debug_from)
+             args.start_checkpoint, args.debug_from, args.enable_multiview_sam_refinement)
 
     # All done
     print("\nTraining complete.")

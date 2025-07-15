@@ -15,3 +15,5 @@ screenshots
 output*
 *.log
 log
+
+datasets/

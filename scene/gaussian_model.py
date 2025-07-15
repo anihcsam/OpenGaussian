@@ -269,6 +269,8 @@ class GaussianModel:
 
         # NOTE: pts feat visualization
         vis_color = (ins_feat + 1) / 2 * 255
+        # Clamp values to valid uint8 range [0, 255]
+        vis_color = np.clip(vis_color, 0, 255)
         r, g, b = vis_color[:, 0].reshape(-1, 1), vis_color[:, 1].reshape(-1, 1), vis_color[:, 2].reshape(-1, 1)
 
         # todo: points not fully optimized due to sampled training images.
