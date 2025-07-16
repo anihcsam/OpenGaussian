@@ -77,8 +77,6 @@ def getCameraToPixelMatrix(image_width, image_height, FoVx, FoVy, cx, cy):
     # Compute intrinsic matrix
     fx = image_width / (2 * math.tan(FoVx / 2))
     fy = image_height / (2 * math.tan(FoVy / 2))
-    # cx = image_width / 2
-    # cy = image_height / 2
 
     K = torch.zeros(3, 3)  # Use 3x3 intrinsic matrix
     K[0, 0] = fx
