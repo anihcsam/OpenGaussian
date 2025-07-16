@@ -181,76 +181,205 @@ class MultiViewSAMMaskRefiner:
                     
         return overlapping_pairs
     
-    def _cameras_overlap(self, cam1, cam2):
-        """Check if two cameras have overlapping views using position, orientation, and FoV"""
+    def _cameras_overlap(self, cam1: Camera, cam2: Camera):
+        """Determine if two cameras have overlapping views using multiple tests"""
+        is_overlap = False
+        
         # Extract camera positions and viewing directions
-        pos1 = cam1.camera_center
-        pos2 = cam2.camera_center
+        cam1_in_world = cam1.world_view_transform_no_t.inverse()
+        cam2_in_world = cam2.world_view_transform_no_t.inverse()
+        
+        # Get camera positions and forward directions
+        pos1 = cam1_in_world[:3, 3]
+        pos2 = cam2_in_world[:3, 3]
+        
+        # Camera forward direction (POSITIVE Z in camera space)
+        forward_cam = torch.tensor([0., 0., 1., 0.], device=cam1_in_world.device)
+        
+        # Transform to world space
+        forward1_in_world = (cam1_in_world @ forward_cam)[:3]
+        forward2_in_world = (cam2_in_world @ forward_cam)[:3]
+        
+        # Normalize directions
+        forward1_in_world = forward1_in_world / torch.norm(forward1_in_world)
+        forward2_in_world = forward2_in_world / torch.norm(forward2_in_world)
         
         # Calculate distance between cameras
         distance = torch.norm(pos1 - pos2)
         
-        # If cameras are too far apart, they likely don't overlap
-        max_distance = 3.0
-        if distance > max_distance:
-            return False
-            
-        # Extract viewing directions from world_view_transform
-        # The viewing direction is the negative Z-axis in camera space, transformed to world space
-        # world_view_transform is world-to-camera, so we need its inverse for camera-to-world
-        world_view_inv1 = torch.inverse(cam1.world_view_transform)
-        world_view_inv2 = torch.inverse(cam2.world_view_transform)
-        
-        # Camera forward direction (negative Z in camera space)
-        forward_cam = torch.tensor([0., 0., -1., 0.], device=pos1.device)
-        
-        # Transform to world space (only rotation part, so w=0)
-        forward1_world = (world_view_inv1 @ forward_cam)[:3]
-        forward2_world = (world_view_inv2 @ forward_cam)[:3]
-        
-        # Normalize directions
-        forward1_world = forward1_world / torch.norm(forward1_world)
-        forward2_world = forward2_world / torch.norm(forward2_world)
-        
         # Calculate angle between viewing directions
-        dot_product = torch.dot(forward1_world, forward2_world)
+        dot_product = torch.dot(forward1_in_world, forward2_in_world)
         dot_product = torch.clamp(dot_product, -1.0, 1.0)  # Numerical stability
         angle_between_directions = torch.acos(dot_product)
         
-        # If cameras are facing nearly opposite directions, they likely don't overlap
+        # 1. Fast rejection test - if cameras are too far apart or facing opposite directions
+        max_distance = 100.0
         max_direction_angle = math.pi * 0.75  # 135 degrees
-        if angle_between_directions > max_direction_angle:
+        
+        if distance > max_distance or angle_between_directions > max_direction_angle:
+            if self.log_to_rerun:
+                print(f"Skipping overlap check: distance {distance:.2f} > {max_distance} or angle {angle_between_directions:.2f} > {max_direction_angle}")
             return False
+        
+        # 2. Special case: cameras are close and looking in similar directions
+        # This catches the "side-by-side looking at same point" case
+        if distance < 1.0 and angle_between_directions < math.pi / 6:  # 30 degrees
+            is_overlap = True
+                
+        # Define the point-in-fov check function within the outer function
+        def _is_point_in_camera_fov(point, camera_pos, camera_forward, fov_x, fov_y):
+            """Check if a point is within a camera's field of view"""
+            # Vector from camera to point
+            to_point = point - camera_pos
+            distance = torch.norm(to_point)
             
-        # Check if cameras can potentially see each other's view based on FoV
-        # Calculate vector from cam1 to cam2
-        cam1_to_cam2 = pos2 - pos1
-        cam1_to_cam2_normalized = cam1_to_cam2 / torch.norm(cam1_to_cam2)
+            # If point is too close to camera, it's not useful for overlap test
+            if distance < 0.001:
+                return False
+                
+            to_point_normalized = to_point / distance
+            
+            # Angle between camera forward and direction to point
+            cos_angle = torch.dot(camera_forward, to_point_normalized)
+            cos_angle = torch.clamp(cos_angle, -1.0, 1.0)
+            
+            # If point is behind camera
+            if cos_angle <= 0:
+                return False
+            
+            # Check if within horizontal and vertical FOV
+            # This is a simplification - for more precision, project to image plane
+            angle = torch.acos(cos_angle)
+            max_fov = max(fov_x, fov_y) / 2.0
+            
+            # Add a small margin for partial overlaps
+            fov_margin = 0.1  # About 5.7 degrees
+            return angle < (max_fov + fov_margin)
         
-        # Calculate vector from cam2 to cam1  
-        cam2_to_cam1 = pos1 - pos2
-        cam2_to_cam1_normalized = cam2_to_cam1 / torch.norm(cam2_to_cam1)
+        # 3. Check intersection of viewing frusta using projected points
+        # Generate sample points along each camera's central viewing ray
+        # Use more points with varying depths for better coverage
+        depths = torch.tensor([0.5, 1.0, 2.0, 5.0, 10.0, 20.0], device=pos1.device)
         
-        # Check if cam2 is within cam1's field of view
-        angle_cam1_to_cam2 = torch.acos(torch.clamp(torch.dot(forward1_world, cam1_to_cam2_normalized), -1.0, 1.0))
-        angle_cam2_to_cam1 = torch.acos(torch.clamp(torch.dot(forward2_world, cam2_to_cam1_normalized), -1.0, 1.0))
+        # Also sample slightly off-axis points for better coverage of the view frustum
+        # These offsets create points that are slightly away from the central ray
+        offsets = [
+            torch.tensor([0.0, 0.0, 0.0], device=pos1.device),  # Center ray
+            torch.tensor([0.1, 0.0, 0.0], device=pos1.device),  # Slightly right
+            torch.tensor([-0.1, 0.0, 0.0], device=pos1.device), # Slightly left
+            torch.tensor([0.0, 0.1, 0.0], device=pos1.device),  # Slightly up
+            torch.tensor([0.0, -0.1, 0.0], device=pos1.device)  # Slightly down
+        ]
         
-        # Use larger FoV (horizontal or vertical) with some margin
-        fov1_max = max(cam1.FoVx, cam1.FoVy)
-        fov2_max = max(cam2.FoVx, cam2.FoVy)
+        # Extract camera right and up directions for offset calculation
+        right1 = cam1_in_world[:3, 0]
+        up1 = cam1_in_world[:3, 1]
+        right2 = cam2_in_world[:3, 0]
+        up2 = cam2_in_world[:3, 1]
         
-        # Add margin to account for overlap at edges
-        fov_margin = np.pi / 6  # 30 degrees margin
+        # Generate sample points for both cameras
+        cam1_sample_points = []
+        cam2_sample_points = []
         
-        # Check if there's potential overlap based on viewing angles and FoVs
-        cam1_sees_cam2_direction = angle_cam1_to_cam2 < (fov1_max / 2 + fov_margin)
-        cam2_sees_cam1_direction = angle_cam2_to_cam1 < (fov2_max / 2 + fov_margin)
+        for d in depths:
+            # Base point at this depth
+            base_point1 = pos1 + d * forward1_in_world
+            base_point2 = pos2 + d * forward2_in_world
+            
+            for offset in offsets:
+                # Calculate points with offsets relative to camera orientation
+                # Scale offsets by depth for wider coverage at greater distances
+                offset_scale = d * 0.1  # 10% of depth as offset scale
+                
+                # Create offset points for camera 1
+                offset_vector1 = offset[0] * right1 * offset_scale + offset[1] * up1 * offset_scale
+                cam1_sample_points.append(base_point1 + offset_vector1)
+                
+                # Create offset points for camera 2
+                offset_vector2 = offset[0] * right2 * offset_scale + offset[1] * up2 * offset_scale
+                cam2_sample_points.append(base_point2 + offset_vector2)
         
-        # Cameras overlap if they're reasonably close, not facing opposite directions,
-        # and at least one can potentially see in the direction of the other
-        overlap = cam1_sees_cam2_direction or cam2_sees_cam1_direction
+        # Check if points from camera 1 are visible in camera 2
+        for point in cam1_sample_points:
+            if _is_point_in_camera_fov(point, pos2, forward2_in_world, cam2.FoVx, cam2.FoVy):
+                is_overlap = True
+                break  # Early exit if overlap found
+                    
+        # If no overlap found yet, check if points from camera 2 are visible in camera 1
+        if not is_overlap:
+            for point in cam2_sample_points:
+                if _is_point_in_camera_fov(point, pos1, forward1_in_world, cam1.FoVx, cam1.FoVy):
+                    is_overlap = True
+                    break  # Early exit if overlap found
         
-        return overlap
+        # 4. Calculate midpoint test (additional test for better detection)
+        if not is_overlap:
+            # Find a point midway between the cameras
+            midpoint = (pos1 + pos2) / 2.0
+            
+            # Create a point slightly offset from midpoint toward scene center
+            # This helps with cameras looking at the same general area
+            scene_center_direction = (forward1_in_world + forward2_in_world) / 2.0
+            scene_center_direction = scene_center_direction / torch.norm(scene_center_direction)
+            
+            # Create sample points along the scene center direction from the midpoint
+            mid_samples = [midpoint + d * scene_center_direction for d in [1.0, 3.0, 5.0]]
+            
+            # Check if both cameras can see any of these midpoint samples
+            for mid_sample in mid_samples:
+                if (_is_point_in_camera_fov(mid_sample, pos1, forward1_in_world, cam1.FoVx, cam1.FoVy) and
+                    _is_point_in_camera_fov(mid_sample, pos2, forward2_in_world, cam2.FoVx, cam2.FoVy)):
+                    is_overlap = True
+                    break
+        
+        # Visualization and debugging
+        if self.log_to_rerun:
+            rot1_q = mat_to_quat(cam1_in_world[:3, :3].unsqueeze(0)).squeeze(0).cpu().numpy()
+            rot2_q = mat_to_quat(cam2_in_world[:3, :3].unsqueeze(0)).squeeze(0).cpu().numpy()
+            image1 = cam1.original_image.cpu().numpy().transpose(1, 2, 0)
+            if image1.dtype != np.uint8:
+                image1 = np.clip(image1 * 255, 0, 255).astype(np.uint8)
+            image2 = cam2.original_image.cpu().numpy().transpose(1, 2, 0)
+            if image2.dtype != np.uint8:
+                image2 = np.clip(image2 * 255, 0, 255).astype(np.uint8)
+            
+            log_camera_pose(
+                "camera_overlap_debug/1",
+                cam1_in_world.cpu().numpy()[:3, 3],
+                np.array([rot1_q[0], rot1_q[1], rot1_q[2], rot1_q[3]]),
+                cam1.intrinsic_matrix.cpu().numpy(),
+                cam1.image_width,
+                cam1.image_height,
+                image=image1,
+            )
+            log_camera_pose(
+                "camera_overlap_debug/2",
+                cam2_in_world.cpu().numpy()[:3, 3],
+                np.array([rot2_q[0], rot2_q[1], rot2_q[2], rot2_q[3]]),
+                cam2.intrinsic_matrix.cpu().numpy(),
+                cam2.image_width,
+                cam2.image_height,
+                image=image2,
+            )
+            
+            # Visualize camera forward directions
+            rr.log(
+                "camera_overlap_debug/z-vectors",
+                rr.Arrows3D(
+                    vectors=[forward1_in_world.cpu().numpy(),
+                            forward2_in_world.cpu().numpy()],
+                    colors=[[0, 0, 255],
+                            [0, 50, 255]],
+                ),
+            )
+            
+            print("Overlap check between cameras:"
+                f"\noverlap: {is_overlap},"
+                f"\ndistance: {distance:.2f},"
+                f"\nangle: {angle_between_directions:.2f} rad")
+            input("Pause (checking camera overlap): press a key to continue")
+        
+        return is_overlap
     
     def project_3d_points_to_image(self, point_3d, camera: Camera, index_gs = 0, index_cam = 0):
         """
@@ -272,7 +401,7 @@ class MultiViewSAMMaskRefiner:
         # Get coordinate of queried point in camera space (direct transform)
         point_camera = camera.world_view_transform_no_t @ point_3d_homogeneous
         if self.log_to_rerun:
-            rr.log(f"gs_{index_gs}/camera_{index_cam}/camera_pose/gs_in_cam", rr.Points3D(point_camera[:3], radii=0.01, colors=[0, 0, 255]))
+            rr.log(f"gs_{index_gs}/camera_{index_cam}/camera_pose/gs_in_cam", rr.Points3D(point_camera.cpu().numpy()[:3], radii=0.01, colors=[0, 0, 255]))
 
         # Check if points are in front of the camera (z > 0 in camera space)
         is_in_front = point_camera[2] > 0
@@ -439,6 +568,16 @@ class MultiViewSAMMaskRefiner:
     def refine_sam_masks(self, cameras, sam_masks, gaussians, sam_level=0):
         """Refine SAM masks using multi-view consistency with efficient overlap detection"""
         
+        if self.log_to_rerun:
+            rr.init("sam_refinement",spawn=True)
+            rr.log(
+                "world_frame",
+                rr.Arrows3D(
+                    vectors=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                    colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+                ),
+            )
+        
         # Pre-compute overlapping camera pairs for efficiency
         print("Computing camera overlaps...")
         overlapping_pairs = self.find_overlapping_cameras(cameras)
@@ -477,14 +616,6 @@ class MultiViewSAMMaskRefiner:
             num_gaussians = gaussians.get_xyz.shape[0]
             
             if self.log_to_rerun:
-                rr.init("sam_refinement",spawn=True)
-                rr.log(
-                    "world_frame",
-                    rr.Arrows3D(
-                        vectors=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-                        colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
-                    ),
-                )
                 rr.log(f"gaussian_pointcloud", rr.Points3D(gaussians.get_xyz.cpu(), radii=0.005, colors=[0, 255, 0]))
             
             # For each sampled Gaussian, collect votes from overlapping cameras only
