@@ -40,5 +40,6 @@ for scan in "${scan_list[@]}"; do
         --test_iterations 30000 \
         --eval \
         --enable_multiview_sam_refinement \
-        --start_checkpoint ./checkpoints/chkpnt30000.pth
+        --start_checkpoint ./checkpoints/chkpnt30000.pth \
+        --log_to_rerun
 done

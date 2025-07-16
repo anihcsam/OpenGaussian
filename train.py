@@ -154,7 +154,7 @@ def separation_loss(feat_mean_stack, iteration):
     return loss
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, \
-             checkpoint, debug_from, enable_multiview_refinement=False):
+             checkpoint, debug_from, enable_multiview_refinement=False, log_to_rerun=False):
     iterations = [opt.start_ins_feat_iter, opt.start_leaf_cb_iter, opt.start_root_cb_iter]
     saving_iterations.extend(iterations)
     checkpoint_iterations.extend(iterations)
@@ -408,7 +408,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     cameras_to_refine.append(view)
             
             # Apply multi-view refinement
-            refiner = MultiViewSAMMaskRefiner(overlap_threshold=0.3, consensus_strategy="majority_vote")
+            refiner = MultiViewSAMMaskRefiner(overlap_threshold=0.3, consensus_strategy="majority_vote", log_to_rerun=log_to_rerun)
             refined_sam_masks = refiner.refine_sam_masks(
                 cameras_to_refine, 
                 original_sam_masks, 
@@ -1043,6 +1043,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--enable_multiview_sam_refinement", action="store_true", default=False, 
                        help="Enable multi-view SAM mask refinement for consistency")
+    parser.add_argument("--log_to_rerun", action="store_true")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     args.checkpoint_iterations.append(args.iterations)
@@ -1057,7 +1058,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), \
              args.test_iterations, args.save_iterations, args.checkpoint_iterations, \
-             args.start_checkpoint, args.debug_from, args.enable_multiview_sam_refinement)
+             args.start_checkpoint, args.debug_from, args.enable_multiview_sam_refinement, args.log_to_rerun)
 
     # All done
     print("\nTraining complete.")
