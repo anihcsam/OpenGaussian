@@ -38,5 +38,7 @@ for scan in "${scan_list[@]}"; do
         --leaf_node_num 5 \
         --pos_weight 1.0 \
         --test_iterations 30000 \
-        --eval
+        --eval \
+        --enable_multiview_sam_refinement \
+        --start_checkpoint ./checkpoints/chkpnt30000.pth
 done

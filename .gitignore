@@ -17,3 +17,5 @@ output*
 log
 
 datasets/
+checkpoints/
+test.ipynb

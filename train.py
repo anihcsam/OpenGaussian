@@ -384,6 +384,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
+            
+        # ##############################################################################################
+        # Multi-view SAM mask refinement - Apply before processing individual views                    #
+        # ##############################################################################################
+        from utils.sam_refinement_utils import MultiViewSAMMaskRefiner
+        sam_level = opt.sam_level
+        if enable_multiview_refinement:
+            print("Applying multi-view SAM mask refinement...")
+    
+            # Collect original SAM masks from all cameras
+            original_sam_masks = []
+            cameras_to_refine = []
+            
+            for view in scene.getTrainCameras().copy():
+                if not view.data_on_gpu:
+                    view.to_gpu()
+                if view.original_sam_mask is not None:
+                    original_sam_masks.append(view.original_sam_mask.cuda())
+                    cameras_to_refine.append(view)
+                else:
+                    original_sam_masks.append(None)
+                    cameras_to_refine.append(view)
+            
+            # Apply multi-view refinement
+            refiner = MultiViewSAMMaskRefiner(overlap_threshold=0.3, consensus_strategy="majority_vote")
+            refined_sam_masks = refiner.refine_sam_masks(
+                cameras_to_refine, 
+                original_sam_masks, 
+                scene.gaussians, 
+                sam_level=sam_level
+            )
+            
+            # Update cameras with refined masks
+            for i, view in enumerate(scene.getTrainCameras()):
+                if refined_sam_masks[i] is not None:
+                    view.original_sam_mask = refined_sam_masks[i]
+                    
+            print("Multi-view SAM mask refinement completed")
+        
+        # END REFINEMENT
+
         # Start learning instance features after 3W steps.
         if iteration > opt.start_ins_feat_iter:
             # NOTE: Freeze the pre-trained Gaussian parameters and only train the instance features.
@@ -631,45 +672,6 @@ def construct_pseudo_ins_feat(scene : Scene, renderFunc, renderArgs,
     # ##############################################################################################
     sorted_train_cameras = sorted(scene.getTrainCameras(), key=lambda Camera: Camera.image_name)
     
-    # ##############################################################################################
-    # Multi-view SAM mask refinement - Apply before processing individual views                    #
-    # ##############################################################################################
-    from utils.sam_refinement_utils import MultiViewSAMMaskRefiner
-    if enable_multiview_refinement and mode in ["root", "leaf"]:  # Only apply refinement in these stages
-        print("Applying multi-view SAM mask refinement...")
-        
-        # Collect original SAM masks from all cameras
-        original_sam_masks = []
-        cameras_to_refine = []
-        
-        for view in sorted_train_cameras:
-            if not view.data_on_gpu:
-                view.to_gpu()
-            if view.original_sam_mask is not None:
-                original_sam_masks.append(view.original_sam_mask.cuda())
-                cameras_to_refine.append(view)
-            else:
-                original_sam_masks.append(None)
-                cameras_to_refine.append(view)
-        
-        # Apply multi-view refinement
-        refiner = MultiViewSAMMaskRefiner(overlap_threshold=0.3, consensus_strategy="majority_vote")
-        refined_sam_masks = refiner.refine_sam_masks(
-            cameras_to_refine, 
-            original_sam_masks, 
-            scene.gaussians, 
-            sam_level=sam_level
-        )
-        
-        # Update cameras with refined masks
-        for i, view in enumerate(sorted_train_cameras):
-            if refined_sam_masks[i] is not None:
-                view.original_sam_mask = refined_sam_masks[i]
-                
-        print("Multi-view SAM mask refinement completed")
-    # ##############################################################################################
-    # END refinenemt                                                                               #
-    # ##############################################################################################
     
     for idx, view in enumerate(tqdm(sorted_train_cameras, desc="construt pseudo feat")):
         if not view.data_on_gpu:
