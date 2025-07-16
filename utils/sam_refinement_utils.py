@@ -559,3 +559,240 @@ class MultiViewSAMMaskRefiner:
             refined_masks.append(refined_mask)
         
         return refined_masks
+
+
+    def project_3d_points_to_image_batch(self, points_3d, camera: Camera, gaussian_indices=None, index_cam=0):
+        """
+        Project batch of 3D points in world coordinates into 2D image pixel coordinates.
+        
+        Parameters:
+        - points_3d (torch.Tensor): A tensor of shape (N, 3) representing points in world coordinates.
+        - camera (Camera): Camera object
+        - gaussian_indices: indices for logging (optional)
+        - index_cam: camera index for logging
+        
+        Returns:
+        - u, v (torch.Tensor): pixel coordinates of shape (N,) each
+        - visible (torch.Tensor): boolean mask of shape (N,) indicating visibility
+        """
+        N = points_3d.shape[0]
+        
+        # Convert points to homogeneous coordinates (add a fourth '1' coordinate)
+        ones = torch.ones(N, 1, device=points_3d.device)
+        points_3d_homogeneous = torch.cat([points_3d, ones], dim=1)  # (N, 4)
+        
+        # Get coordinates in camera space (batch matrix multiplication)
+        points_camera = (camera.world_view_transform_no_t @ points_3d_homogeneous.T).T  # (N, 4)
+        
+        # Logging only for first point if enabled and batch size is 1
+        if self.log_to_rerun and N == 1 and gaussian_indices is not None:
+            rr.log(f"gs_{gaussian_indices[0]}/camera_{index_cam}/camera_pose/gs_in_cam", 
+                rr.Points3D(points_camera[0, :3], radii=0.01, colors=[0, 0, 255]))
+        
+        # Check if points are in front of the camera (z > 0 in camera space)
+        is_in_front = points_camera[:, 2] > 0  # (N,)
+        
+        # Apply projection matrix to map to clip space
+        points_clip = (camera.projection_matrix_no_t @ points_camera.T).T  # (N, 4)
+        
+        # Perspective division
+        w = points_clip[:, 3]  # (N,)
+        # Avoid division by zero
+        w = torch.where(torch.abs(w) < 1e-8, torch.sign(w) * 1e-8, w)
+        points_ndc = points_clip / w.unsqueeze(1)  # (N, 4)
+        
+        # Viewport transformation
+        u = points_ndc[:, 0] * (camera.image_width / 2.0) + camera.cx   # (N,)
+        v = points_ndc[:, 1] * (camera.image_height / 2.0) + camera.cy  # (N,)
+        
+        # Check bounds
+        in_bounds = (u >= 0) & (u < camera.image_width) & (v >= 0) & (v < camera.image_height)
+        visible = is_in_front & in_bounds  # (N,)
+        
+        return u, v, visible
+
+    def collect_mask_votes_batch(self, points_3d, overlapping_cam_indices, cameras, sam_masks, 
+                            sam_level=0, gaussian_indices=None):
+        """
+        Collect mask ID votes for a batch of 3D points from overlapping cameras.
+        
+        Parameters:
+        - points_3d (torch.Tensor): shape (N, 3) - batch of 3D points
+        - overlapping_cam_indices: list of camera indices that overlap with current camera
+        - cameras: list of camera objects
+        - sam_masks: list of SAM masks
+        - sam_level: SAM level to use
+        - gaussian_indices: indices for logging
+        
+        Returns:
+        - votes_list: list of votes for each point, where each vote is [(cam_idx, mask_id), ...]
+        """
+        N = points_3d.shape[0]
+        votes_list = [[] for _ in range(N)]
+        
+        for other_cam_idx in overlapping_cam_indices:
+            other_camera = cameras[other_cam_idx]
+            
+            # Project all points to this camera in parallel
+            u, v, visible = self.project_3d_points_to_image_batch(
+                points_3d, other_camera, gaussian_indices, other_cam_idx
+            )
+            
+            # Logging for single point if enabled
+            if self.log_to_rerun and N == 1 and gaussian_indices is not None:
+                print(f"Camera {other_cam_idx} visibility: {visible[0].item()}, x: {u[0].item()}, y: {v[0].item()}")
+                
+                image = other_camera.original_image.cpu().numpy().transpose(1, 2, 0)
+                if image.dtype != np.uint8:
+                    image = np.clip(image * 255, 0, 255).astype(np.uint8)
+            
+            # Get mask IDs for visible points
+            if sam_masks[other_cam_idx] is not None:
+                mask_shape = sam_masks[other_cam_idx].shape
+                H, W = mask_shape[1], mask_shape[2]
+                
+                for i in range(N):
+                    if visible[i]:
+                        x, y = int(u[i].item()), int(v[i].item())
+                        if 0 <= y < H and 0 <= x < W:
+                            mask_id = sam_masks[other_cam_idx][sam_level, y, x].item()
+                            votes_list[i].append((other_cam_idx, mask_id))
+                            
+                            # Logging for single point
+                            if self.log_to_rerun and N == 1 and i == 0:
+                                cv2.circle(image, (x, y), radius=5, color=(255, 0, 0), thickness=-1)
+            
+            # Camera pose logging for single point
+            if self.log_to_rerun and N == 1 and gaussian_indices is not None:
+                world2cam = np.linalg.inv(other_camera.world_view_transform_no_t.cpu().numpy())
+                t = world2cam[:3, 3]
+                R = world2cam[:3, :3]
+                rot_q = mat_to_quat(torch.from_numpy(R).unsqueeze(0)).squeeze(0).numpy()
+                K = other_camera.intrinsic_matrix.cpu().numpy()
+                log_camera_pose(
+                    f"gs_{gaussian_indices[0]}/camera_{other_cam_idx}",
+                    t,
+                    np.array([rot_q[0], rot_q[1], rot_q[2], rot_q[3]]),
+                    K,
+                    other_camera.image_width,
+                    other_camera.image_height,
+                    image=image,
+                )
+        
+        return votes_list
+
+    def refine_sam_masks_batch(self, cameras, sam_masks, gaussians, sam_level=0):
+        """Refine SAM masks using multi-view consistency with GPU-parallelized processing"""
+        
+        # Pre-compute overlapping camera pairs for efficiency
+        print("Computing camera overlaps...")
+        overlapping_pairs = self.find_overlapping_cameras(cameras)
+        
+        # Build adjacency map for quick lookup
+        overlap_map = {}
+        for i in range(len(cameras)):
+            overlap_map[i] = set()
+        
+        for cam1_idx, cam2_idx in overlapping_pairs:
+            overlap_map[cam1_idx].add(cam2_idx)
+            overlap_map[cam2_idx].add(cam1_idx)
+            
+        print(f"Found {len(overlapping_pairs)} overlapping camera pairs")
+        
+        refined_masks = []
+        
+        for cam_idx, camera in tqdm(enumerate(cameras), total=len(cameras), desc="Refining masks"):
+            if sam_masks[cam_idx] is None:
+                refined_masks.append(None)
+                continue
+                
+            original_mask = sam_masks[cam_idx].clone()
+            refined_mask = original_mask.clone()
+            
+            # Get cameras that overlap with current camera
+            overlapping_cam_indices = list(overlap_map[cam_idx])
+            
+            if not overlapping_cam_indices:
+                # No overlaps, keep original mask
+                refined_masks.append(refined_mask)
+                continue
+            
+            # Sample subset of Gaussians for efficiency (every 10th Gaussian)
+            sample_step = 10
+            num_gaussians = gaussians.get_xyz.shape[0]
+            
+            if self.log_to_rerun:
+                rr.init("sam_refinement", spawn=True)
+                rr.log(
+                    "world_frame",
+                    rr.Arrows3D(
+                        vectors=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                        colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+                    ),
+                )
+                rr.log(f"gaussian_pointcloud", rr.Points3D(gaussians.get_xyz.cpu(), radii=0.005, colors=[0, 255, 0]))
+            
+            # Process Gaussians in batches for GPU parallelization
+            batch_size = 4096 if not self.log_to_rerun else 1  # Use batch size 1 for logging
+            
+            for batch_start in range(0, num_gaussians, batch_size * sample_step):
+                batch_end = min(batch_start + batch_size * sample_step, num_gaussians)
+                
+                # Get batch of Gaussian indices
+                gaussian_indices = list(range(batch_start, batch_end, sample_step))
+                if not gaussian_indices:
+                    continue
+                    
+                # Extract batch of 3D positions
+                batch_gaussians_3d = gaussians.get_xyz[gaussian_indices]  # (batch_size, 3)
+                
+                # Logging for single point
+                if self.log_to_rerun and len(gaussian_indices) == 1:
+                    gaussian_3d_cpu = batch_gaussians_3d[0].cpu()
+                    rr.log(f"gs_{gaussian_indices[0]}", rr.Points3D(gaussian_3d_cpu, radii=0.01, colors=[255, 0, 0]))
+                
+                # Collect votes for all points in batch from overlapping cameras
+                votes_list = self.collect_mask_votes_batch(
+                    batch_gaussians_3d, overlapping_cam_indices, cameras, sam_masks, 
+                    sam_level, gaussian_indices if self.log_to_rerun else None
+                )
+                
+                # Project batch to current camera
+                u_curr, v_curr, visible_curr = self.project_3d_points_to_image_batch(
+                    batch_gaussians_3d, camera
+                )
+                
+                # Process each point in the batch
+                for i, (gaussian_idx, votes) in enumerate(zip(gaussian_indices, votes_list)):
+                    if not votes:
+                        continue
+                        
+                    # Apply consensus rule
+                    consensus_id = self.apply_consensus_rule(votes)
+                    
+                    if visible_curr[i] and consensus_id >= 0:
+                        x_curr, y_curr = int(u_curr[i].item()), int(v_curr[i].item())
+                        
+                        # Update mask
+                        H, W = refined_mask.shape[1], refined_mask.shape[2]
+                        changes_made = 0
+                        
+                        if 0 <= y_curr < H and 0 <= x_curr < W:
+                            if refined_mask[sam_level, y_curr, x_curr] != consensus_id:
+                                refined_mask[sam_level, y_curr, x_curr] = consensus_id
+                                changes_made += 1
+                        
+                        # Debug visualization for single point
+                        if self.visualize_matches and changes_made > 0:
+                            self.debug_visualize_projections(
+                                batch_gaussians_3d[i], votes, consensus_id, cameras, sam_masks, 
+                                sam_level, current_cam_idx=cam_idx, max_pairs=2, gaussian_idx=gaussian_idx
+                            )
+                    
+                    # Logging pause for single point
+                    if self.log_to_rerun and len(gaussian_indices) == 1:
+                        input("Pause: press a key to continue")
+            
+            refined_masks.append(refined_mask)
+        
+        return refined_masks
