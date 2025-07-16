@@ -259,32 +259,29 @@ class MultiViewSAMMaskRefiner:
         - u,v.
         - flag visible or not
         """
-
+        
         # Convert points to homogeneous coordinates (add a fourth '1' coordinate)
         point_3d_homogeneous = torch.cat([point_3d, torch.tensor([1.0], device=point_3d.device)])
 
         # Get coordinate of queried point in camera space (direct transform)
-        point_camera = camera.world_view_transform.cpu().T @ point_3d_homogeneous
+        point_camera = camera.world_view_transform_no_t.cpu() @ point_3d_homogeneous
         rr.log(f"gs_{index_gs}/camera_{index_cam}/camera_pose/gs_in_cam", rr.Points3D(point_camera[:3], radii=0.01, colors=[0, 0, 255]))
 
         # Check if points are in front of the camera (z > 0 in camera space)
         is_in_front = point_camera[2] > 0
 
         # Apply projection matrix to map to NDC
-        point_ndc_homogeneous = camera.projection_matrix.cpu().T @ point_camera  # Shape: (4)
+        point_clip = camera.projection_matrix_no_t.cpu() @ point_camera  # Shape: (4)
 
-        # Perform perspective divide to get normalized device coordinates (NDC)
-        point_ndc = point_ndc_homogeneous[:3] / point_ndc_homogeneous[3]
+        # 2. Perspective division
+        w = point_clip[3]
+        point_ndc = point_clip / w
 
-        # Apply intrinsic camera matrix to map NDC to pixel coordinates
-        point_pixel = camera.intrinsic_matrix.cpu() @ point_ndc  # Shape: (3)
+        # 3. Viewport transformation
+        u = point_ndc[0] * (camera.image_width / 2.0) + camera.cx
+        v = point_ndc[1] * (camera.image_height / 2.0) + camera.cy
 
-        # Extract x and y pixel coordinates
-        pixel_coordinates = point_pixel[:2]  # Shape: (2)
-
-        u = (pixel_coordinates[0]).int()
-        v = (pixel_coordinates[1]).int()
-        return u, v, (0 <= u < camera.image_width and 0 <= v < camera.image_height and is_in_front)
+        return int(u), int(v), (0 <= u < camera.image_width and 0 <= v < camera.image_height and is_in_front)
     
     def collect_mask_votes_for_point(self, point_3d, cameras, sam_masks, sam_level=0):
         """Collect mask ID votes for a 3D point from all visible cameras"""
@@ -395,7 +392,7 @@ class MultiViewSAMMaskRefiner:
                         cv2.circle(image, (int(x), int(y)), radius=5, color=(255, 0, 0), thickness=-1)
                     
                     # Transform from world frame to camera frame (inverse transform)
-                    world2cam = np.linalg.inv(other_camera.world_view_transform.T.cpu().numpy())
+                    world2cam = np.linalg.inv(other_camera.world_view_transform_no_t.cpu().numpy())
                     t = world2cam[:3, 3]
                     R = world2cam[:3, :3]
                     rot_q = mat_to_quat(torch.from_numpy(R).unsqueeze(0)).squeeze(0).numpy()
