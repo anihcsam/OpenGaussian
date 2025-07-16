@@ -95,12 +95,13 @@ def calculate_metrics(gt, pred, total_classes):
 if __name__ == "__main__":
     # scene_list = [  'scene0000_00', 'scene0062_00', 'scene0070_00', 'scene0097_00', 'scene0140_00', 
     #                 'scene0200_00', 'scene0347_00', 'scene0400_00', 'scene0590_00', 'scene0645_00']
-    scene_list = ['scene0062_00_sam2_l']
+    scene_list = ['f3563e3c-8']
 
     iteration = 90000
     for scan_name in scene_list:
         # (1) GT ply    change!
-        gt_file_path = f"/gdata/cold1/wuyanmin/OpenGaussian/data/scannet_2d_3types/{scan_name}/{scan_name}_vh_clean_2.labels.ply"
+        # gt_file_path = f"/gdata/cold1/wuyanmin/OpenGaussian/data/scannet_2d_3types/{scan_name}/{scan_name}_vh_clean_2.labels.ply"
+        gt_file_path = f"../data/OpenGaussian/OpenGaussian/scannet/scene0062_00/scene0062_00_vh_clean_2.labels.ply"
         points, labels = read_labels_from_ply(gt_file_path)
 
         # (2) note: 19 & 15 & 10 classes
@@ -122,7 +123,8 @@ if __name__ == "__main__":
         
         # (4) load gaussian ply file
         model_path = f"output/{scan_name}/"
-        ply_path = os.path.join(model_path, f"point_cloud/iteration_{iteration}/point_cloud.ply")
+        # ply_path = os.path.join(model_path, f"point_cloud/iteration_{iteration}/point_cloud.ply")
+        ply_path = os.path.join(model_path, f"point_cloud/iteration_90000/point_cloud.ply")
         ply_data = PlyData.read(ply_path)
         vertex_data = ply_data['vertex'].data
         # NOTE Filter out points based on their opacity values.

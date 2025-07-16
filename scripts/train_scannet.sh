@@ -20,13 +20,18 @@
 # ============== [10 scenes] ==============
 # scan_list=("scene0000_00" "scene0062_00" "scene0070_00" "scene0097_00" "scene0140_00" \
 # "scene0200_00" "scene0347_00" "scene0400_00" "scene0590_00" "scene0645_00")
-scan_list=("scene0062_00")
+scan_list=("scene0062_00_sam2_l")
 
+# -s /gdata/cold1/wuyanmin/OpenGaussian/data/onedrive/scannet/${scan} \
+# -s ../data/OpenGaussian/OpenGaussian/scannet/${scan} \
+# -s ../data/scannet_preprocessed/scans/${scan} \
+
+# gpu_num=3     # change!
 gpu_num=0     # change!
 for scan in "${scan_list[@]}"; do
     echo "Training for ${scan} ....."
-    CUDA_VISIBLE_DEVICES=$gpu_num python3 train.py --port 601$gpu_num \
-        -s ./datasets/scans/${scan} \
+    CUDA_VISIBLE_DEVICES=$gpu_num python train_refined_sam_masks.py --port 601$gpu_num \
+        -s ../data/scannet_preprocessed/scans/${scan} \
         -r 2 \
         --frozen_init_pts \
         --iterations 90_000 \
@@ -40,6 +45,7 @@ for scan in "${scan_list[@]}"; do
         --test_iterations 30000 \
         --eval \
         --enable_multiview_sam_refinement \
-        --start_checkpoint ./checkpoints/chkpnt30000.pth \
-        --log_to_rerun
+        --start_checkpoint /home/andrii/TUM/ml3dg/project/OpenGaussian/output/scene0062_00_sam2_l_refined/chkpnt50000.pth
 done
+
+        # --start_checkpoint /home/andrii/TUM/ml3dg/project/OpenGaussian/output/scene0062_00_sam2_l/chkpnt30000.pth
