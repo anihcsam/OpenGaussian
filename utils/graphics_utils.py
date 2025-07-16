@@ -48,6 +48,9 @@ def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     Rt = np.linalg.inv(C2W)
     return np.float32(Rt)
 
+import math
+import torch
+
 def getProjectionMatrix(znear, zfar, fovX, fovY):
     tanHalfFovY = math.tan((fovY / 2))
     tanHalfFovX = math.tan((fovX / 2))
@@ -69,6 +72,20 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
     P[2, 2] = z_sign * zfar / (zfar - znear)
     P[2, 3] = -(zfar * znear) / (zfar - znear)
     return P
+
+def getCameraToPixelMatrix(image_width, image_height, FoVx, FoVy, cx, cy):
+    # Compute intrinsic matrix
+    fx = image_width / (2 * math.tan(FoVx / 2))
+    fy = image_height / (2 * math.tan(FoVy / 2))
+
+    K = torch.zeros(3, 3)  # Use 3x3 intrinsic matrix
+    K[0, 0] = fx
+    K[1, 1] = fy
+    K[0, 2] = cx
+    K[1, 2] = cy
+    K[2, 2] = 1
+    
+    return K
 
 def fov2focal(fov, pixels):
     return pixels / (2 * math.tan(fov / 2))

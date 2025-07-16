@@ -93,8 +93,9 @@ def calculate_metrics(gt, pred, total_classes):
     return ious, mean_iou, accuracy, mean_class_accuracy
 
 if __name__ == "__main__":
-    scene_list = [  'scene0000_00', 'scene0062_00', 'scene0070_00', 'scene0097_00', 'scene0140_00', 
-                    'scene0200_00', 'scene0347_00', 'scene0400_00', 'scene0590_00', 'scene0645_00']
+    # scene_list = [  'scene0000_00', 'scene0062_00', 'scene0070_00', 'scene0097_00', 'scene0140_00', 
+    #                 'scene0200_00', 'scene0347_00', 'scene0400_00', 'scene0590_00', 'scene0645_00']
+    scene_list = ['scene0062_00_sam2_l']
 
     iteration = 90000
     for scan_name in scene_list:
