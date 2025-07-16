@@ -160,9 +160,12 @@ def log_camera_pose(
 class MultiViewSAMMaskRefiner:
     """Refines SAM masks by enforcing consistency across overlapping views"""
     
-    def __init__(self, overlap_threshold=0.3, consensus_strategy="majority_vote"):
+    def __init__(self, overlap_threshold=0.3, consensus_strategy="majority_vote", log_to_rerun=False):
         self.overlap_threshold = overlap_threshold
         self.consensus_strategy = consensus_strategy
+        self.log_to_rerun = log_to_rerun
+        if self.log_to_rerun:
+            print("MultiViewSAMMaskRefiner initialized with logging to rerun enabled")
         
     def find_overlapping_cameras(self, cameras):
         """Find pairs of cameras with overlapping views using frustum intersection"""
@@ -265,7 +268,8 @@ class MultiViewSAMMaskRefiner:
 
         # Get coordinate of queried point in camera space (direct transform)
         point_camera = camera.world_view_transform_no_t.cpu() @ point_3d_homogeneous
-        rr.log(f"gs_{index_gs}/camera_{index_cam}/camera_pose/gs_in_cam", rr.Points3D(point_camera[:3], radii=0.01, colors=[0, 0, 255]))
+        if self.log_to_rerun:
+            rr.log(f"gs_{index_gs}/camera_{index_cam}/camera_pose/gs_in_cam", rr.Points3D(point_camera[:3], radii=0.01, colors=[0, 0, 255]))
 
         # Check if points are in front of the camera (z > 0 in camera space)
         is_in_front = point_camera[2] > 0
@@ -357,15 +361,16 @@ class MultiViewSAMMaskRefiner:
             sample_step = 10
             num_gaussians = gaussians.get_xyz.shape[0]
             
-            rr.init("sam_refinement",spawn=True)
-            rr.log(
-                "world_frame",
-                rr.Arrows3D(
-                    vectors=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-                    colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
-                ),
-            )
-            rr.log(f"gaussian_pointcloud", rr.Points3D(gaussians.get_xyz.cpu(), radii=0.005, colors=[0, 255, 0]))
+            if self.log_to_rerun:
+                rr.init("sam_refinement",spawn=True)
+                rr.log(
+                    "world_frame",
+                    rr.Arrows3D(
+                        vectors=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                        colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+                    ),
+                )
+                rr.log(f"gaussian_pointcloud", rr.Points3D(gaussians.get_xyz.cpu(), radii=0.005, colors=[0, 255, 0]))
             
             # For each sampled Gaussian, collect votes from overlapping cameras only
             for gaussian_idx in range(0, num_gaussians, sample_step):
@@ -397,15 +402,16 @@ class MultiViewSAMMaskRefiner:
                     R = world2cam[:3, :3]
                     rot_q = mat_to_quat(torch.from_numpy(R).unsqueeze(0)).squeeze(0).numpy()
                     K = other_camera.intrinsic_matrix.cpu().numpy()
-                    log_camera_pose(
-                        f"gs_{gaussian_idx}/camera_{other_cam_idx}",
-                        t,
-                        np.array([rot_q[0], rot_q[1], rot_q[2], rot_q[3]]),
-                        K,
-                        other_camera.image_width,
-                        other_camera.image_height,
-                        image=image,
-                    )
+                    if self.log_to_rerun:
+                        log_camera_pose(
+                            f"gs_{gaussian_idx}/camera_{other_cam_idx}",
+                            t,
+                            np.array([rot_q[0], rot_q[1], rot_q[2], rot_q[3]]),
+                            K,
+                            other_camera.image_width,
+                            other_camera.image_height,
+                            image=image,
+                        )
                         
                 # Apply consensus and update the current camera's mask
                 if votes:
