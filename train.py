@@ -410,12 +410,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Apply multi-view refinement
             refiner = MultiViewSAMMaskRefiner(overlap_threshold=0.3, consensus_strategy="majority_vote",
                                               log_to_rerun=log_to_rerun, visualize_matches=visualize_matches)
-            refined_sam_masks = refiner.refine_sam_masks_batch(
-                cameras_to_refine, 
-                original_sam_masks, 
-                scene.gaussians, 
-                sam_level=sam_level
-            )
+            
+            # Disable vectorization when logging
+            if log_to_rerun or visualize_matches:
+                refined_sam_masks = refiner.refine_sam_masks(
+                    cameras_to_refine, 
+                    original_sam_masks, 
+                    scene.gaussians, 
+                    sam_level=sam_level
+                )
+            else:
+                refined_sam_masks = refiner.refine_sam_masks_batch(
+                    cameras_to_refine, 
+                    original_sam_masks, 
+                    scene.gaussians, 
+                    sam_level=sam_level
+                )
             
             # Update cameras with refined masks
             for i, view in enumerate(scene.getTrainCameras()):
