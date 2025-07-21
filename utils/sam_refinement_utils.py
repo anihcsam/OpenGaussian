@@ -173,12 +173,28 @@ class MultiViewSAMMaskRefiner:
     def find_overlapping_cameras(self, cameras):
         """Find pairs of cameras with overlapping views using frustum intersection"""
         overlapping_pairs = []
+        camera_overlap_count = [0] * len(cameras)  # Track overlaps per camera
+        max_overlaps_per_camera = 7
         
         for i, cam1 in enumerate(cameras):
+            # Skip if this camera already has too many overlaps
+            if camera_overlap_count[i] >= max_overlaps_per_camera:
+                continue
+                
             for j, cam2 in enumerate(cameras[i+1:], i+1):
+                # Skip if either camera has too many overlaps
+                if camera_overlap_count[j] >= max_overlaps_per_camera:
+                    continue
+                    
                 if self._cameras_overlap(cam1, cam2):
                     overlapping_pairs.append((i, j))
+                    camera_overlap_count[i] += 1
+                    camera_overlap_count[j] += 1
                     
+                    # Break if current camera has reached its limit
+                    if camera_overlap_count[i] >= max_overlaps_per_camera:
+                        break
+                        
         return overlapping_pairs
     
     def _cameras_overlap(self, cam1: Camera, cam2: Camera):
@@ -435,21 +451,32 @@ class MultiViewSAMMaskRefiner:
                     
         return votes
     
-    def apply_consensus_rule(self, votes):
-        """Apply consensus rule to resolve mask ID conflicts"""
+    def apply_consensus_rule(self, votes, confidence_threshold=0.8):
+        """Apply consensus rule to resolve mask ID conflicts with confidence threshold"""
         if not votes:
             return -1  # Invalid/no consensus
             
         if self.consensus_strategy == "majority_vote":
             # Count votes for each mask ID
             vote_counts = defaultdict(int)
+            total_valid_votes = 0
+            
             for _, mask_id in votes:
                 if mask_id >= 0:  # Only count valid mask IDs
                     vote_counts[mask_id] += 1
-                    
-            if vote_counts:
-                # Return the mask ID with most votes
-                return max(vote_counts, key=vote_counts.get)
+                    total_valid_votes += 1
+            
+            if vote_counts and total_valid_votes > 0 and total_valid_votes >= int(1 / (1 - confidence_threshold)):
+                # Find the mask ID with most votes
+                winning_mask_id = max(vote_counts, key=vote_counts.get)
+                max_votes = vote_counts[winning_mask_id]
+                
+                # Calculate confidence as percentage of total valid votes
+                confidence = max_votes / total_valid_votes
+                
+                # Only return consensus if confidence exceeds threshold
+                if confidence >= confidence_threshold:
+                    return winning_mask_id
                 
         return -1  # No consensus
     
