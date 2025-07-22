@@ -1,6 +1,7 @@
 import os
 import json
 import numpy as np
+import argparse
 
 def load_transform_matrix(file_path):
     """
@@ -22,7 +23,8 @@ def process_directory(directory_path):
     if not os.path.isdir(color_dir) or not os.path.isdir(pose_dir):
         return
 
-    # scannet
+    # ScanNet camera intrinsics (high-resolution: 1296x968)
+    # These are the standard ScanNet parameters for the high-res images
     transform_data = {
             'w': 1296,
             'h': 968,
@@ -33,7 +35,7 @@ def process_directory(directory_path):
             # 'aabb_scale': 2,
             'frames': [],
         }
-    # # scannet
+    # Alternative lower-resolution parameters (640x512) - uncomment if needed
     # transform_data = {
     #         'w': 640,
     #         'h': 512,
@@ -86,23 +88,47 @@ def process_directory(directory_path):
 
     return transform_data
 
-# Directory containing the scenes
-base_directory = 'PATH_TO_YOUR_SCANNET'     # TODO
-
-# Process each scene directory and create JSON files
-for scene_dir in os.listdir(base_directory):
-    # if scene_dir != "scene0000_00":
-    #     continue
+def main():
+    parser = argparse.ArgumentParser(description='Convert ScanNet data to OpenGaussian format')
+    parser.add_argument('scannet_path', type=str, 
+                       help='Path to the ScanNet data directory (should contain scene directories)')
+    parser.add_argument('--scene', type=str, 
+                       help='Process only this specific scene (e.g., scene0062_00)')
     
-    scene_path = os.path.join(base_directory, scene_dir)
-    if os.path.isdir(scene_path):
-        # Process the directory and get the transform data
-        transform_data = process_directory(scene_path)
+    args = parser.parse_args()
+    
+    # Use provided scannet_path
+    base_directory = args.scannet_path
+    
+    if not os.path.exists(base_directory):
+        print(f"Error: Directory not found at {base_directory}")
+        return
+    
+    print(f"Converting ScanNet data from: {base_directory}")
+    
+    # Process each scene directory and create JSON files
+    for scene_dir in os.listdir(base_directory):
+        # If a specific scene is requested, process only that one
+        if args.scene and scene_dir != args.scene:
+            continue
+            
+        scene_path = os.path.join(base_directory, scene_dir)
+        if os.path.isdir(scene_path):
+            print(f"Processing scene: {scene_dir}")
+            
+            # Process the directory and get the transform data
+            transform_data = process_directory(scene_path)
 
-        print(scene_path)
-        
-        # Create the JSON file
-        if transform_data:
-            json_file_path = os.path.join(scene_path, "transforms_train.json")
-            with open(json_file_path, 'w') as json_file:
-                json.dump(transform_data, json_file, indent=4)
+            print(f"  - Processed {scene_path}")
+            
+            # Create the JSON file
+            if transform_data:
+                json_file_path = os.path.join(scene_path, "transforms_train.json")
+                with open(json_file_path, 'w') as json_file:
+                    json.dump(transform_data, json_file, indent=4)
+                print(f"  - Created {json_file_path}")
+            else:
+                print(f"  - No transform data generated for {scene_dir}")
+
+if __name__ == "__main__":
+    main()

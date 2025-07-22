@@ -1,3 +1,4 @@
+import argparse
 import numpy as np
 from plyfile import PlyData
 import open3d as o3d
@@ -31,6 +32,7 @@ def visualize_ply(ply_path):
     o3d.visualization.draw_geometries([pcd])
 
 if __name__ == "__main__":
-    # Replace with the path to your PLY file
-    ply_path = "output/xxxxxxxx-x/point_cloud/iteration_x0000/point_cloud.ply"
-    visualize_ply(ply_path)
+    parser = argparse.ArgumentParser(description="Visualize a PLY point cloud with opacity filtering.")
+    parser.add_argument("ply_path", type=str, help="Path to the PLY file")
+    args = parser.parse_args()
+    visualize_ply(args.ply_path)

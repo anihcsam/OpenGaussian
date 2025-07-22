@@ -17,6 +17,7 @@ from utils.loss_utils import l1_loss, ssim, l2_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.cameras import Camera
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -28,6 +29,7 @@ from os import makedirs
 import torchvision
 import numpy as np
 from utils.sh_utils import RGB2SH
+import math
 # import faiss
 from scene.kmeans_quantize import Quantize_kMeans
 from bitarray import bitarray
@@ -35,13 +37,423 @@ from utils.system_utils import mkdir_p
 from utils.opengs_utlis import mask_feature_mean, pair_mask_feature_mean, \
     get_SAM_mask_and_feat, load_code_book, \
     calculate_iou, calculate_distances, calculate_pairwise_distances
-from utils.sam_refinement_utils import MultiViewSAMMaskRefiner
 
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+# Multi-view SAM mask refinement imports and utilities
+from collections import defaultdict
+
+class MultiViewSAMMaskRefiner:
+    """Refines SAM masks by enforcing consistency across overlapping views"""
+    
+    def __init__(self, overlap_threshold=0.3, consensus_strategy="majority_vote"):
+        self.overlap_threshold = overlap_threshold
+        self.consensus_strategy = consensus_strategy
+        
+    def find_overlapping_cameras(self, cameras):
+        """Find pairs of cameras with overlapping views using frustum intersection"""
+        overlapping_pairs = []
+        
+        for i, cam1 in enumerate(cameras):
+            for j, cam2 in enumerate(cameras[i+1:], i+1):
+                if self._cameras_overlap(cam1, cam2):
+                    overlapping_pairs.append((i, j))
+                    
+        return overlapping_pairs
+    
+    def _cameras_overlap(self, cam1, cam2):
+        """Check if two cameras have overlapping views using position, orientation, and FoV"""
+        # Extract camera positions and viewing directions
+        pos1 = cam1.camera_center
+        pos2 = cam2.camera_center
+        
+        # Calculate distance between cameras
+        distance = torch.norm(pos1 - pos2)
+        
+        # If cameras are too far apart, they likely don't overlap
+        max_distance = 3.0
+        if distance > max_distance:
+            return False
+            
+        # Extract viewing directions from world_view_transform
+        # The viewing direction is the negative Z-axis in camera space, transformed to world space
+        # world_view_transform is world-to-camera, so we need its inverse for camera-to-world
+        world_view_inv1 = torch.inverse(cam1.world_view_transform)
+        world_view_inv2 = torch.inverse(cam2.world_view_transform)
+        
+        # Camera forward direction (negative Z in camera space)
+        forward_cam = torch.tensor([0., 0., -1., 0.], device=pos1.device)
+        
+        # Transform to world space (only rotation part, so w=0)
+        forward1_world = (world_view_inv1 @ forward_cam)[:3]
+        forward2_world = (world_view_inv2 @ forward_cam)[:3]
+        
+        # Normalize directions
+        forward1_world = forward1_world / torch.norm(forward1_world)
+        forward2_world = forward2_world / torch.norm(forward2_world)
+        
+        # Calculate angle between viewing directions
+        dot_product = torch.dot(forward1_world, forward2_world)
+        dot_product = torch.clamp(dot_product, -1.0, 1.0)  # Numerical stability
+        angle_between_directions = torch.acos(dot_product)
+        
+        # If cameras are facing nearly opposite directions, they likely don't overlap
+        max_direction_angle = math.pi * 0.75  # 135 degrees
+        if angle_between_directions > max_direction_angle:
+            return False
+            
+        # Check if cameras can potentially see each other's view based on FoV
+        # Calculate vector from cam1 to cam2
+        cam1_to_cam2 = pos2 - pos1
+        cam1_to_cam2_normalized = cam1_to_cam2 / torch.norm(cam1_to_cam2)
+        
+        # Calculate vector from cam2 to cam1  
+        cam2_to_cam1 = pos1 - pos2
+        cam2_to_cam1_normalized = cam2_to_cam1 / torch.norm(cam2_to_cam1)
+        
+        # Check if cam2 is within cam1's field of view
+        angle_cam1_to_cam2 = torch.acos(torch.clamp(torch.dot(forward1_world, cam1_to_cam2_normalized), -1.0, 1.0))
+        angle_cam2_to_cam1 = torch.acos(torch.clamp(torch.dot(forward2_world, cam2_to_cam1_normalized), -1.0, 1.0))
+        
+        # Use larger FoV (horizontal or vertical) with some margin
+        fov1_max = max(cam1.FoVx, cam1.FoVy)
+        fov2_max = max(cam2.FoVx, cam2.FoVy)
+        
+        # Add margin to account for overlap at edges
+        fov_margin = np.pi / 6  # 30 degrees margin
+        
+        # Check if there's potential overlap based on viewing angles and FoFs
+        cam1_sees_cam2_direction = angle_cam1_to_cam2 < (fov1_max / 2 + fov_margin)
+        cam2_sees_cam1_direction = angle_cam2_to_cam1 < (fov2_max / 2 + fov_margin)
+        
+        # Cameras overlap if they're reasonably close, not facing opposite directions,
+        # and at least one can potentially see in the direction of the other
+        overlap = cam1_sees_cam2_direction or cam2_sees_cam1_direction
+        
+        return overlap
+    
+    def debug_projection_pipeline(self, point_3d, camera, verbose=True):
+        """
+        Debug function to trace through the projection pipeline step by step.
+        Returns detailed information about each transformation step.
+        """
+        debug_info = {}
+        
+        # Step 1: Input point
+        point_4d = torch.cat([point_3d, torch.ones(1, device=point_3d.device)])
+        debug_info['world_point'] = point_3d.cpu().numpy()
+        
+        # Step 2: World to Camera
+        point_cam = camera.world_view_transform @ point_4d
+        debug_info['camera_point'] = point_cam.cpu().numpy()
+        debug_info['camera_depth'] = point_cam[2].cpu().numpy()
+        debug_info['behind_camera'] = point_cam[2] >= 0
+        
+        # Step 3: Camera to Clip
+        point_clip = camera.full_proj_transform @ point_4d
+        debug_info['clip_point'] = point_clip.cpu().numpy()
+        debug_info['w_component'] = point_clip[3].cpu().numpy()
+        
+        # Step 4: Perspective divide
+        if abs(point_clip[3]) > 1e-6:
+            point_ndc = point_clip[:3] / point_clip[3]
+            debug_info['ndc_point'] = point_ndc.cpu().numpy()
+            debug_info['in_frustum'] = (-1 <= point_ndc[0] <= 1 and 
+                                    -1 <= point_ndc[1] <= 1 and 
+                                    -1 <= point_ndc[2] <= 1)
+            
+            # Step 5: Screen coordinates
+            H, W = camera.image_height, camera.image_width
+            x_pixel = int((point_ndc[0] + 1) * W / 2)
+            y_pixel = int((1 - point_ndc[1]) * H / 2)
+            debug_info['screen_coords'] = (x_pixel, y_pixel)
+            debug_info['in_image_bounds'] = (0 <= x_pixel < W and 0 <= y_pixel < H)
+        else:
+            debug_info['perspective_divide_failed'] = True
+            
+        # Camera info
+        debug_info['camera_info'] = {
+            'fov_x_deg': camera.FoVx * 180 / np.pi,
+            'fov_y_deg': camera.FoVy * 180 / np.pi,
+            'znear': camera.znear,
+            'zfar': camera.zfar,
+            'image_size': (W, H)
+        }
+        
+        if verbose:
+            print(f"\n=== PROJECTION DEBUG ===")
+            for key, value in debug_info.items():
+                print(f"{key}: {value}")
+            print("========================\n")
+        
+        return debug_info
+        
+    def project_3d_points_to_image(self, point_3d, camera: Camera, index_gs = 0, index_cam = 0):
+        """
+        Project 3D point in world coordinates into 2D image pixel coordinates.
+        
+        Parameters:
+        - points_3d (torch.Tensor): A tensor of shape (3) representing point in world coordinates.
+        - world_to_camera (torch.Tensor): A 4x4 transformation matrix mapping world coordinates to camera coordinates.
+        - camera_to_pixel (torch.Tensor): A 4x4 transformation matrix mapping camera coordinates to pixel coordinates.
+        
+        Returns:
+        - u,v.
+        - flag visible or not
+        """
+        
+        # Convert points to homogeneous coordinates (add a fourth '1' coordinate)
+        point_3d_homogeneous = torch.cat([point_3d, torch.tensor([1.0], device=point_3d.device)])
+
+        # Get coordinate of queried point in camera space (direct transform)
+        point_camera = camera.world_view_transform_no_t @ point_3d_homogeneous
+        # if self.log_to_rerun:
+        #     rr.log(f"gs_{index_gs}/camera_{index_cam}/camera_pose/gs_in_cam", rr.Points3D(point_camera[:3], radii=0.01, colors=[0, 0, 255]))
+
+        # Check if points are in front of the camera (z > 0 in camera space)
+        is_in_front = point_camera[2] > 0
+
+        # Apply projection matrix to map to NDC
+        point_clip = camera.projection_matrix_no_t @ point_camera  # Shape: (4)
+
+        # 2. Perspective division
+        w = point_clip[3]
+        point_ndc = point_clip / w
+
+        # 3. Viewport transformation
+        u = point_ndc[0] * (camera.image_width / 2.0) + camera.cx
+        v = point_ndc[1] * (camera.image_height / 2.0) + camera.cy
+
+        return int(u), int(v), (0 <= u < camera.image_width and 0 <= v < camera.image_height and is_in_front)
+
+    
+    def apply_consensus_rule(self, votes):
+        """Apply consensus rule to resolve mask ID conflicts"""
+        if not votes:
+            return -1  # Invalid/no consensus
+            
+        if self.consensus_strategy == "majority_vote":
+            # Count votes for each mask ID
+            vote_counts = defaultdict(int)
+            for _, mask_id in votes:
+                if mask_id >= 0:  # Only count valid mask IDs
+                    vote_counts[mask_id] += 1
+                    
+            if vote_counts:
+                # Return the mask ID with most votes
+                return max(vote_counts, key=vote_counts.get)
+                
+        return -1  # No consensus
+
+
+    def debug_visualize_projections(self, gaussian_3d, votes, consensus_id, cameras, sam_masks, sam_level=0, 
+                            current_cam_idx=None, max_pairs=None, gaussian_idx=None):
+        """Debug visualization showing ALL images where the Gaussian projects with valid votes"""
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        import numpy as np
+        
+        if len(votes) < 2:
+            return  # Need at least 2 votes for visualization
+        
+        # Filter out votes with mask ID = -1 (irrelevant points)
+        valid_votes = [(cam_idx, mask_id) for cam_idx, mask_id in votes if mask_id != -1]
+        if len(valid_votes) < 2:
+            return  # Need at least 2 valid votes for visualization
+        
+        # Get unique camera indices from valid votes
+        voting_cameras = list(set([cam_idx for cam_idx, _ in valid_votes]))
+        
+        # If current camera is provided, add it to the list
+        if current_cam_idx is not None and current_cam_idx not in voting_cameras:
+            voting_cameras.append(current_cam_idx)
+        
+        # Sort cameras for consistent visualization
+        voting_cameras.sort()
+    
+        # Calculate grid layout for subplots
+        num_cameras = len(voting_cameras)
+        if num_cameras <= 4:
+            rows, cols = 1, num_cameras
+        elif num_cameras <= 8:
+            rows, cols = 2, 4
+        elif num_cameras <= 12:
+            rows, cols = 3, 4
+        else:
+            rows, cols = 4, 4  # Maximum 16 cameras
+            voting_cameras = voting_cameras[:16]  # Limit to 16 for readability
+        
+        # Create figure with subplots
+        fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 4*rows))
+        
+        # Handle axes properly - ensure axes is always a 2D array
+        if rows == 1 and cols == 1:
+            axes = np.array([[axes]])
+        elif rows == 1:
+            axes = axes.reshape(1, -1)
+        elif cols == 1:
+            axes = axes.reshape(-1, 1)
+        
+        # Project 3D point to all cameras and visualize
+        for idx, cam_idx in enumerate(voting_cameras):
+            row = idx // cols
+            col = idx % cols
+            
+            # Get the correct axis
+            ax = axes[row, col]
+            
+            camera = cameras[cam_idx]
+            
+            # Project 3D point to this camera
+            x, y, visible = self.project_3d_points_to_image(gaussian_3d, camera)
+            
+            # Get mask ID at projection point (with bounds checking)
+            mask_id = -1
+            if visible and x is not None and y is not None:
+                if 0 <= y < sam_masks[cam_idx].shape[1] and 0 <= x < sam_masks[cam_idx].shape[2]:
+                    mask_id = sam_masks[cam_idx][sam_level, y, x].item()
+            
+            # Display camera image
+            if hasattr(camera, 'original_image') and camera.original_image is not None:
+                img = camera.original_sam_mask.cpu().numpy().transpose(1, 2, 0)[:, :, 0]
+                ax.imshow(img)
+            else:
+                # Create blank image if no original image
+                ax.imshow(np.ones((camera.image_height, camera.image_width, 3)) * 0.5)
+            
+            # Overlay projected point (only if mask ID != -1)
+            if visible and x is not None and mask_id != -1:
+                circle = patches.Circle((x, y), radius=8, color='red', fill=False, linewidth=3)
+                ax.add_patch(circle)
+                # Show mask ID on image
+                ax.text(x+15, y-15, f'ID: {mask_id}', color='red', fontsize=10, fontweight='bold',
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+            
+            # Add title with camera info
+            vote_info = f"Vote: {mask_id}" if mask_id != -1 else "No vote"
+            consensus_info = f"→ {consensus_id}" if mask_id != -1 else ""
+            ax.set_title(f'Cam {cam_idx}\n{vote_info} {consensus_info}', fontsize=12)
+            
+            ax.axis('off')
+            
+            # Print projection details to console
+            print(f"   📷 Cam{cam_idx}: projected=({x}, {y}), visible={visible}, mask_id={mask_id}")
+        
+        # Hide unused subplots
+        for idx in range(len(voting_cameras), rows * cols):
+            row = idx // cols
+            col = idx % cols
+            axes[row, col].axis('off')
+        
+        # Add overall title with voting info
+        vote_info = ', '.join([f'Cam{cam_idx}:ID{mask_id}' for cam_idx, mask_id in valid_votes])
+        fig.suptitle(f'3D Point Projection Debug - Gaussian #{gaussian_idx}\n'
+                    f'Votes: [{vote_info}] → Consensus: {consensus_id}', 
+                    fontsize=16, fontweight='bold')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Wait for user input before continuing
+        input("Press Enter to continue...")
+        plt.close(fig)
+
+    def refine_sam_masks(self, cameras, sam_masks, gaussians, sam_level=0):
+        """Refine SAM masks using multi-view consistency with efficient overlap detection"""
+        
+        # Pre-compute overlapping camera pairs for efficiency
+        print("Computing camera overlaps...")
+        # overlapping_pairs = self.find_overlapping_cameras(cameras)
+
+        overlapping_pairs = []
+        
+        for i, cam1 in enumerate(cameras):
+            for j, cam2 in enumerate(cameras[i+1:], i+1):
+                if self._cameras_overlap(cam1, cam2):
+                    overlapping_pairs.append((i, j))
+        
+        # Build adjacency map for quick lookup
+        overlap_map = {}
+        for i in range(len(cameras)):
+            overlap_map[i] = set()
+        
+        for cam1_idx, cam2_idx in overlapping_pairs:
+            overlap_map[cam1_idx].add(cam2_idx)
+            overlap_map[cam2_idx].add(cam1_idx)
+            
+        print(f"Found {len(overlapping_pairs)} overlapping camera pairs")
+        
+        refined_masks = []
+        
+        for cam_idx, camera in tqdm(enumerate(cameras), total=len(cameras), desc="Refining masks"):
+            if sam_masks[cam_idx] is None:
+                refined_masks.append(None)
+                continue
+                
+            original_mask = sam_masks[cam_idx].clone()
+            refined_mask = original_mask.clone()
+            
+            # Get cameras that overlap with current camera
+            overlapping_cam_indices = overlap_map[cam_idx]
+            
+            if not overlapping_cam_indices:
+                # No overlaps, keep original mask
+                refined_masks.append(refined_mask)
+                continue
+            
+            # Sample subset of Gaussians for efficiency (every 10th Gaussian)
+            sample_step = 10
+            num_gaussians = gaussians.get_xyz.shape[0]
+            
+            # For each sampled Gaussian, collect votes from overlapping cameras only
+            valid_votes = 0
+            for gaussian_idx in range(40000, num_gaussians, sample_step):
+                gaussian_3d = gaussians.get_xyz[gaussian_idx]  # Actual 3D position
+                
+                # Project this Gaussian only to overlapping cameras
+                votes = []
+                for other_cam_idx in overlapping_cam_indices:
+                    other_camera = cameras[other_cam_idx]
+                    x, y, visible = self.project_3d_points_to_image(gaussian_3d, other_camera)
+                    if visible and x is not None and y is not None:
+                        mask_id = sam_masks[other_cam_idx][sam_level, y, x].item()
+                        votes.append((other_cam_idx, mask_id))
+                
+                # Apply consensus and update the current camera's mask
+                if votes:
+                    consensus_id = self.apply_consensus_rule(votes)
+                    # Project Gaussian to current camera and update mask in local neighborhood
+                    x_curr, y_curr, visible_curr = self.project_3d_points_to_image(gaussian_3d, camera)
+                    
+                    if visible_curr and consensus_id >= 0 and x_curr is not None and y_curr is not None:
+                        # Update a small neighborhood around the projected point
+                        H, W = refined_mask.shape[1], refined_mask.shape[2]
+                        changes_made = 0  # Track changes for this Gaussian
+    
+                        for dy in range(1):  # 11x11 neighborhood
+                            for dx in range(1):
+                                new_y, new_x = y_curr + dy, x_curr + dx
+                                if 0 <= new_y < H and 0 <= new_x < W:
+                                    if refined_mask[sam_level, new_y, new_x] != consensus_id:
+                                        refined_mask[sam_level, new_y, new_x] = consensus_id
+                                        changes_made += 1
+                        
+                        # Call debug visualization if changes were made
+                        # if changes_made > 0:
+                        #     self.debug_visualize_projections(
+                        #         gaussian_3d, votes, consensus_id, cameras, sam_masks, 
+                        #         sam_level, current_cam_idx=cam_idx, max_pairs=2, gaussian_idx=gaussian_idx
+                        #     )                        
+                    valid_votes += 1 
+
+            # print(f"valid_votes/num_gaussians: {valid_votes}/{num_gaussians}")
+            refined_masks.append(refined_mask)
+        
+        return refined_masks
 
 # Randomly initialize 300 colors for visualizing the SAM mask. [OpenGaussian]
 np.random.seed(42)
@@ -155,7 +567,7 @@ def separation_loss(feat_mean_stack, iteration):
     return loss
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, \
-             checkpoint, debug_from, enable_multiview_refinement=False, log_to_rerun=False, visualize_matches=False):
+             checkpoint, debug_from, enable_multiview_refinement=False):
     iterations = [opt.start_ins_feat_iter, opt.start_leaf_cb_iter, opt.start_root_cb_iter]
     saving_iterations.extend(iterations)
     checkpoint_iterations.extend(iterations)
@@ -385,57 +797,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
-            
-        # ##############################################################################################
-        # Multi-view SAM mask refinement - Apply before processing individual views                    #
-        # ##############################################################################################
-        sam_level = opt.sam_level
-        if enable_multiview_refinement and iteration > opt.start_ins_feat_iter:
-            print("Applying multi-view SAM mask refinement...")
-    
-            # Collect original SAM masks from all cameras
-            original_sam_masks = []
-            cameras_to_refine = []
-            
-            for view in scene.getTrainCameras().copy():
-                if not view.data_on_gpu:
-                    view.to_gpu()
-                if view.original_sam_mask is not None:
-                    original_sam_masks.append(view.original_sam_mask.cuda())
-                    cameras_to_refine.append(view)
-                else:
-                    original_sam_masks.append(None)
-                    cameras_to_refine.append(view)
-            
-            # Apply multi-view refinement
-            refiner = MultiViewSAMMaskRefiner(overlap_threshold=0.3, consensus_strategy="majority_vote",
-                                              log_to_rerun=log_to_rerun, visualize_matches=visualize_matches)
-            
-            # Disable vectorization when logging
-            if log_to_rerun or visualize_matches:
-                refined_sam_masks = refiner.refine_sam_masks(
-                    cameras_to_refine, 
-                    original_sam_masks, 
-                    scene.gaussians, 
-                    sam_level=sam_level
-                )
-            else:
-                refined_sam_masks = refiner.refine_sam_masks_batch(
-                    cameras_to_refine, 
-                    original_sam_masks, 
-                    scene.gaussians, 
-                    sam_level=sam_level
-                )
-            
-            # Update cameras with refined masks
-            for i, view in enumerate(scene.getTrainCameras()):
-                if refined_sam_masks[i] is not None:
-                    view.original_sam_mask = refined_sam_masks[i]
-                    
-            print("Multi-view SAM mask refinement completed")
-            enable_multiview_refinement=False
-        # END REFINEMENT
-
         # Start learning instance features after 3W steps.
         if iteration > opt.start_ins_feat_iter:
             # NOTE: Freeze the pre-trained Gaussian parameters and only train the instance features.
@@ -474,7 +835,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # 2.1 coarse-level
         if cb_mode == "root":   
             # Only consider valid pixels
-            keeped_pix = viewpoint_cam.pesudo_ins_feat.sum(dim=(0)) > 0     # Invalid pixels of pseudo-labels
+            keeped_pix = viewpoint_cam.pesudo_ins_feat.sum(dim=0) > 0     # Invalid pixels of pseudo-labels
             keeped_pix = keeped_pix.bool()&rendered_silhouette.bool()       # Empty regions after rescaling
             keeped_pix = keeped_pix&(~invalid_pix.unsqueeze(0))             # Invalid area of the original mask
             keeped_pix = rendered_silhouette.bool()
@@ -674,7 +1035,7 @@ def construct_pseudo_ins_feat(scene : Scene, renderFunc, renderArgs,
                             root_num=64, leaf_num=10,   # k1, k2
                             sam_level=3,
                             save_memory=False,
-                            enable_multiview_refinement=False):
+                            enable_multiview_refinement=False):  # New parameter
     torch.cuda.empty_cache()
     # ##############################################################################################
     # [Stage 2.1, 2.2] Render all training views once to construct pseudo-instance feature labels. #
@@ -683,7 +1044,41 @@ def construct_pseudo_ins_feat(scene : Scene, renderFunc, renderArgs,
     # ##############################################################################################
     sorted_train_cameras = sorted(scene.getTrainCameras(), key=lambda Camera: Camera.image_name)
     
-    
+    # ##############################################################################################
+    # Multi-view SAM mask refinement - Apply before processing individual views                    #
+    # ##############################################################################################
+    if enable_multiview_refinement and mode in ["root", "leaf"]:  # Only apply refinement in these stages
+        print("Applying multi-view SAM mask refinement...")
+        
+        # Collect original SAM masks from all cameras
+        original_sam_masks = []
+        cameras_to_refine = []
+        
+        for view in sorted_train_cameras:
+            if not view.data_on_gpu:
+                view.to_gpu()
+            if view.original_sam_mask is not None:
+                original_sam_masks.append(view.original_sam_mask.cuda())
+                cameras_to_refine.append(view)
+            else:
+                original_sam_masks.append(None)
+                cameras_to_refine.append(view)
+        
+        # Apply multi-view refinement
+        refiner = MultiViewSAMMaskRefiner(overlap_threshold=0.3, consensus_strategy="majority_vote")
+        refined_sam_masks = refiner.refine_sam_masks(
+            cameras_to_refine, 
+            original_sam_masks, 
+            scene.gaussians, 
+            sam_level=sam_level
+        )
+        
+        # Update cameras with refined masks
+        for i, view in enumerate(sorted_train_cameras):
+            if refined_sam_masks[i] is not None:
+                view.original_sam_mask = refined_sam_masks[i]
+                
+        print("Multi-view SAM mask refinement completed")
     for idx, view in enumerate(tqdm(sorted_train_cameras, desc="construt pseudo feat")):
         if not view.data_on_gpu:
             view.to_gpu()
@@ -930,6 +1325,7 @@ def construct_pseudo_ins_feat(scene : Scene, renderFunc, renderArgs,
         # count the matches of each leaf (fine-level cluster) across all viewpoints.
         leaf_per_view_matched_mask = match_info[:, :, 0].to(torch.int64) # [k1*k2, num_cam] matched mask id
         match_info_sum = match_info.sum(dim=1)  # [k1*k2, (matched_mask_id, matched_score, b_matched)]
+
         leaf_ave_score = match_info_sum[:, 1] / (match_info_sum[:, 2]+ 1e-6)    # [k1*k2] ave score
         leaf_occu_count = match_info_sum[:, 2]          # [k1*k2] number of matches for each leaf
         
@@ -1054,8 +1450,6 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--enable_multiview_sam_refinement", action="store_true", default=False, 
                        help="Enable multi-view SAM mask refinement for consistency")
-    parser.add_argument("--log_to_rerun", action="store_true")
-    parser.add_argument("--visualize_matches", action="store_true")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     args.checkpoint_iterations.append(args.iterations)
@@ -1070,7 +1464,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), \
              args.test_iterations, args.save_iterations, args.checkpoint_iterations, \
-             args.start_checkpoint, args.debug_from, args.enable_multiview_sam_refinement, args.log_to_rerun, args.visualize_matches)
+             args.start_checkpoint, args.debug_from, args.enable_multiview_sam_refinement)
 
     # All done
     print("\nTraining complete.")
