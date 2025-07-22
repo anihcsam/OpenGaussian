@@ -157,6 +157,72 @@ def log_camera_pose(
                 ),
     )
 
+from scene.gaussian_model import GaussianModel
+from ashawkey_diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from utils.sh_utils import eval_sh
+def render_single_gaussian(viewpoint_camera, pc: GaussianModel, gaussian_idx: int, scaling_modifier=1.0, **kwargs):
+    """
+    Render only a single Gaussian splat at the specified index from the model.
+    """
+    import math
+    bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+
+    # Set up rasterization configuration
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=False
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    # Select only the single Gaussian at gaussian_idx
+    means3D = pc.get_xyz[gaussian_idx:gaussian_idx+1]
+    means2D = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device="cuda")
+    try:
+        means2D.retain_grad()
+    except Exception:
+        pass
+
+    opacity = pc.get_opacity[gaussian_idx:gaussian_idx+1]
+    scales = pc.get_scaling[gaussian_idx:gaussian_idx+1]
+    rotations = pc.get_rotation[gaussian_idx:gaussian_idx+1]
+    shs = pc.get_features[gaussian_idx:gaussian_idx+1]
+
+    # If you have precomputed colors, handle here (optional)
+    colors_precomp = None
+    if kwargs.get("override_color") is not None:
+        colors_precomp = kwargs["override_color"]
+        if colors_precomp.ndim == 2:
+            colors_precomp = colors_precomp[gaussian_idx:gaussian_idx+1]
+        elif colors_precomp.ndim == 1:
+            colors_precomp = colors_precomp.unsqueeze(0)
+
+    # Rasterize only this Gaussian
+    rendered_image, radii, rendered_depth, rendered_alpha = rasterizer(
+        means3D=means3D,
+        means2D=means2D,
+        shs=shs if colors_precomp is None else None,
+        colors_precomp=colors_precomp,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=None
+    )
+    return rendered_image, radii, rendered_depth, rendered_alpha
+
 class MultiViewSAMMaskRefiner:
     """Refines SAM masks by enforcing consistency across overlapping views"""
     
@@ -349,7 +415,7 @@ class MultiViewSAMMaskRefiner:
                     break
         
         # Visualization and debugging
-        if self.log_to_rerun:
+        if self.log_to_rerun and False:
             rot1_q = mat_to_quat(cam1_in_world[:3, :3].unsqueeze(0)).squeeze(0).cpu().numpy()
             rot2_q = mat_to_quat(cam2_in_world[:3, :3].unsqueeze(0)).squeeze(0).cpu().numpy()
             image1 = cam1.original_image.cpu().numpy().transpose(1, 2, 0)
@@ -661,7 +727,26 @@ class MultiViewSAMMaskRefiner:
                     if self.log_to_rerun:
                         print(f"Camera {other_cam_idx} visibility: {visible}, x: {x}, y: {y}")
                         
-                        image = other_camera.original_image.cpu().numpy().transpose(1, 2, 0)
+                        # Testing rendering single gaussian splat
+                        image, _, _, _ = render_single_gaussian(other_camera, gaussians, gaussian_idx=gaussian_idx)
+                        if not isinstance(image, np.ndarray):
+                            image = image.detach().cpu().numpy()
+                            image = np.transpose(image, (1, 2, 0))
+                        if image.dtype != np.uint8:
+                            image = np.clip(image * 255, 0, 255).astype(np.uint8)
+                        if image.ndim == 2:
+                            image = np.stack([image]*3, axis=-1)  # Make grayscale 3-channel
+                        if image.shape[2] == 1:
+                            image = np.repeat(image, 3, axis=2)
+                        image = np.ascontiguousarray(image)
+                        
+                        # Count number of non-black pixels in image
+                        non_black_mask = np.any(image != 0, axis=2)
+                        num_non_black_pixels = np.count_nonzero(non_black_mask)
+                        print(f"Render for {other_cam_idx} of non-black pixels: {num_non_black_pixels}")
+                        
+                        # NOTE: remplaced logging of original image with rendered image of single splat
+                        # image = other_camera.original_image.cpu().numpy().transpose(1, 2, 0)
                         if image.dtype != np.uint8:
                             image = np.clip(image * 255, 0, 255).astype(np.uint8)
                     
