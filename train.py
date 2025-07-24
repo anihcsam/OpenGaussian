@@ -155,7 +155,7 @@ def separation_loss(feat_mean_stack, iteration):
     return loss
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, \
-             checkpoint, debug_from, enable_multiview_refinement=False, log_to_rerun=False, visualize_matches=False):
+             checkpoint, debug_from, enable_multiview_refinement=False, log_to_rerun=False, visualize_matches=False, vote_collection_strategy="projection"):
     iterations = [opt.start_ins_feat_iter, opt.start_leaf_cb_iter, opt.start_root_cb_iter]
     saving_iterations.extend(iterations)
     checkpoint_iterations.extend(iterations)
@@ -409,7 +409,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             # Apply multi-view refinement
             refiner = MultiViewSAMMaskRefiner(overlap_threshold=0.3, consensus_strategy="majority_vote",
-                                              log_to_rerun=log_to_rerun, visualize_matches=visualize_matches)
+                                              log_to_rerun=log_to_rerun, visualize_matches=visualize_matches, vote_collection_strategy=vote_collection_strategy)
             
             # Disable vectorization when logging
             if log_to_rerun or visualize_matches:
@@ -1056,6 +1056,7 @@ if __name__ == "__main__":
                        help="Enable multi-view SAM mask refinement for consistency")
     parser.add_argument("--log_to_rerun", action="store_true")
     parser.add_argument("--visualize_matches", action="store_true")
+    parser.add_argument("--vote_collection_strategy", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     args.checkpoint_iterations.append(args.iterations)
@@ -1070,7 +1071,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), \
              args.test_iterations, args.save_iterations, args.checkpoint_iterations, \
-             args.start_checkpoint, args.debug_from, args.enable_multiview_sam_refinement, args.log_to_rerun, args.visualize_matches)
+             args.start_checkpoint, args.debug_from, args.enable_multiview_sam_refinement, args.log_to_rerun, args.visualize_matches, args.vote_collection_strategy)
 
     # All done
     print("\nTraining complete.")

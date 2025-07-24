@@ -226,15 +226,17 @@ def render_single_gaussian(viewpoint_camera, pc: GaussianModel, gaussian_idx: in
 class MultiViewSAMMaskRefiner:
     """Refines SAM masks by enforcing consistency across overlapping views"""
     
-    def __init__(self, overlap_threshold=0.3, consensus_strategy="majority_vote", log_to_rerun=False, visualize_matches=False):
+    def __init__(self, overlap_threshold=0.3, consensus_strategy="majority_vote", log_to_rerun=False, visualize_matches=False, vote_collection_strategy = "projection"):
         self.overlap_threshold = overlap_threshold
         self.consensus_strategy = consensus_strategy
         self.log_to_rerun = log_to_rerun
         self.visualize_matches = visualize_matches
+        self.vote_collection_strategy = vote_collection_strategy
         if self.log_to_rerun:
             print("MultiViewSAMMaskRefiner initialized with logging to rerun enabled")
         if self.visualize_matches:
             print("MultiViewSAMMaskRefiner initialized with enabled visualization for gaussian matches")
+        print(f"Using vote collection strategy: {self.vote_collection_strategy}")
         
     def find_overlapping_cameras(self, cameras):
         """Find pairs of cameras with overlapping views using frustum intersection"""
@@ -532,7 +534,8 @@ class MultiViewSAMMaskRefiner:
                     vote_counts[mask_id] += 1
                     total_valid_votes += 1
             
-            if vote_counts and total_valid_votes > 0 and total_valid_votes >= int(1 / (1 - confidence_threshold)):
+            SPAXY_THRESHOLD = 4 # did 62th scene with 3
+            if vote_counts and total_valid_votes >= SPAXY_THRESHOLD:
                 # Find the mask ID with most votes
                 winning_mask_id = max(vote_counts, key=vote_counts.get)
                 max_votes = vote_counts[winning_mask_id]
@@ -855,7 +858,7 @@ class MultiViewSAMMaskRefiner:
         return u, v, visible
 
     def collect_mask_votes_batch(self, points_3d, overlapping_cam_indices, cameras, sam_masks, 
-                            sam_level=0, gaussian_indices=None):
+                            sam_level=0, gaussian_indices=None, gaussians=None):
         """
         Collect mask ID votes for a batch of 3D points from overlapping cameras.
         
@@ -876,34 +879,66 @@ class MultiViewSAMMaskRefiner:
         for other_cam_idx in overlapping_cam_indices:
             other_camera = cameras[other_cam_idx]
             
-            # Project all points to this camera in parallel
-            u, v, visible = self.project_3d_points_to_image_batch(
-                points_3d, other_camera, gaussian_indices, other_cam_idx
-            )
-            
-            # Logging for single point if enabled
-            if self.log_to_rerun and N == 1 and gaussian_indices is not None:
-                print(f"Camera {other_cam_idx} visibility: {visible[0].item()}, x: {u[0].item()}, y: {v[0].item()}")
+            if self.vote_collection_strategy == "rasterizing":
+                # print(f"Collecting votes for camera {other_cam_idx} using rasterizing strategy")
                 
-                image = other_camera.original_image.cpu().numpy().transpose(1, 2, 0)
-                if image.dtype != np.uint8:
-                    image = np.clip(image * 255, 0, 255).astype(np.uint8)
-            
-            # Get mask IDs for visible points
-            if sam_masks[other_cam_idx] is not None:
-                mask_shape = sam_masks[other_cam_idx].shape
-                H, W = mask_shape[1], mask_shape[2]
-                
-                for i in range(N):
-                    if visible[i]:
-                        x, y = int(u[i].item()), int(v[i].item())
-                        if 0 <= y < H and 0 <= x < W:
-                            mask_id = sam_masks[other_cam_idx][sam_level, y, x].item()
+                i = 0
+                for gaussian_index in gaussian_indices:
+                    if i % 10 != 0:
+                        # Skip 9 of 10 gaussians for now (runtime)
+                        i += 1
+                        continue
+                    image, _, _, _ = render_single_gaussian(other_camera, gaussians, gaussian_idx=gaussian_index)
+                    if not isinstance(image, np.ndarray):
+                        image = image.detach().cpu().numpy()
+                        image = np.transpose(image, (1, 2, 0))
+                    if image.dtype != np.uint8:
+                        image = np.clip(image * 255, 0, 255).astype(np.uint8)
+                    if image.ndim == 2:
+                        image = np.stack([image]*3, axis=-1)  # Make grayscale 3-channel
+                    if image.shape[2] == 1:
+                        image = np.repeat(image, 3, axis=2)
+                    image = np.ascontiguousarray(image)
+ 
+                    # Obtain mask from image
+                    splat_binary_mask = np.any(image != 0, axis=2)
+                    # print(f"Number of non-black pixels in rendered image for Gaussian {gaussian_index} in camera {other_cam_idx}: {np.count_nonzero(splat_binary_mask)}")
+                    if sam_masks[other_cam_idx] is not None and np.count_nonzero(splat_binary_mask):
+                        mask_id = self._get_most_common_id_in_mask(sam_masks[other_cam_idx], splat_binary_mask)
+                        if mask_id >= 0:
                             votes_list[i].append((other_cam_idx, mask_id))
-                            
-                            # Logging for single point
-                            if self.log_to_rerun and N == 1 and i == 0:
-                                cv2.circle(image, (x, y), radius=5, color=(255, 0, 0), thickness=-1)
+                            # print(f"Collected vote for Gaussian {gaussian_index}/{i} in camera {other_cam_idx}: mask_id={mask_id}")
+                    i += 1
+            elif self.vote_collection_strategy == "projection":
+                # print(f"Collecting votes for camera {other_cam_idx} using projection strategy")
+                # Project all points to this camera in parallel
+                u, v, visible = self.project_3d_points_to_image_batch(
+                    points_3d, other_camera, gaussian_indices, other_cam_idx
+                )
+                
+                # Logging for single point if enabled
+                if self.log_to_rerun and N == 1 and gaussian_indices is not None:
+                    print(f"Camera {other_cam_idx} visibility: {visible[0].item()}, x: {u[0].item()}, y: {v[0].item()}")
+                    
+                    image = other_camera.original_image.cpu().numpy().transpose(1, 2, 0)
+                    if image.dtype != np.uint8:
+                        image = np.clip(image * 255, 0, 255).astype(np.uint8)
+                
+                # Get mask IDs for visible points
+                if sam_masks[other_cam_idx] is not None:
+                    mask_shape = sam_masks[other_cam_idx].shape
+                    H, W = mask_shape[1], mask_shape[2]
+                    
+                    for i in range(N):
+                        if visible[i]:
+                            x, y = int(u[i].item()), int(v[i].item())
+                            if 0 <= y < H and 0 <= x < W:
+                                mask_id = sam_masks[other_cam_idx][sam_level, y, x].item()
+                                votes_list[i].append((other_cam_idx, mask_id))
+                                
+                                # Logging for single point
+                                if self.log_to_rerun and N == 1 and i == 0:
+                                    cv2.circle(image, (x, y), radius=5, color=(255, 0, 0), thickness=-1)
             
             # Camera pose logging for single point
             if self.log_to_rerun and N == 1 and gaussian_indices is not None:
@@ -997,45 +1032,101 @@ class MultiViewSAMMaskRefiner:
                 # Collect votes for all points in batch from overlapping cameras
                 votes_list = self.collect_mask_votes_batch(
                     batch_gaussians_3d, overlapping_cam_indices, cameras, sam_masks, 
-                    sam_level, gaussian_indices if self.log_to_rerun else None
+                    sam_level, gaussian_indices, gaussians
                 )
                 
-                # Project batch to current camera
-                u_curr, v_curr, visible_curr = self.project_3d_points_to_image_batch(
-                    batch_gaussians_3d, camera
-                )
-                
-                # Process each point in the batch
-                for i, (gaussian_idx, votes) in enumerate(zip(gaussian_indices, votes_list)):
-                    if not votes:
-                        continue
-                        
-                    # Apply consensus rule
-                    consensus_id = self.apply_consensus_rule(votes)
+                if self.vote_collection_strategy == "projection":
+                    # Project batch to current camera
+                    u_curr, v_curr, visible_curr = self.project_3d_points_to_image_batch(
+                        batch_gaussians_3d, camera
+                    )
                     
-                    if visible_curr[i] and consensus_id >= 0:
-                        x_curr, y_curr = int(u_curr[i].item()), int(v_curr[i].item())
+                    # Process each point in the batch
+                    for i, (gaussian_idx, votes) in enumerate(zip(gaussian_indices, votes_list)):
+                        if not votes:
+                            continue
+                            
+                        # Apply consensus rule
+                        consensus_id = self.apply_consensus_rule(votes)
                         
-                        # Update mask
-                        H, W = refined_mask.shape[1], refined_mask.shape[2]
-                        changes_made = 0
+                        if visible_curr[i] and consensus_id >= 0:
+                            x_curr, y_curr = int(u_curr[i].item()), int(v_curr[i].item())
+                            
+                            # Update mask
+                            H, W = refined_mask.shape[1], refined_mask.shape[2]
+                            changes_made = 0
+                            
+                            if 0 <= y_curr < H and 0 <= x_curr < W:
+                                if refined_mask[sam_level, y_curr, x_curr] != consensus_id:
+                                    refined_mask[sam_level, y_curr, x_curr] = consensus_id
+                                    changes_made += 1
+                            
+                            # Debug visualization for single point
+                            if self.visualize_matches and changes_made > 0:
+                                self.debug_visualize_projections(
+                                    batch_gaussians_3d[i], votes, consensus_id, cameras, sam_masks, 
+                                    sam_level, current_cam_idx=cam_idx, max_pairs=2, gaussian_idx=gaussian_idx
+                                )
                         
-                        if 0 <= y_curr < H and 0 <= x_curr < W:
-                            if refined_mask[sam_level, y_curr, x_curr] != consensus_id:
-                                refined_mask[sam_level, y_curr, x_curr] = consensus_id
-                                changes_made += 1
+                        # Logging pause for single point
+                        if self.log_to_rerun and len(gaussian_indices) == 1:
+                            input("Pause: press a key to continue")
+                elif self.vote_collection_strategy == "rasterizing":
+                    for i, (gaussian_idx, votes) in enumerate(zip(gaussian_indices, votes_list)):
+                        if not votes:
+                            continue
                         
-                        # Debug visualization for single point
-                        if self.visualize_matches and changes_made > 0:
-                            self.debug_visualize_projections(
-                                batch_gaussians_3d[i], votes, consensus_id, cameras, sam_masks, 
-                                sam_level, current_cam_idx=cam_idx, max_pairs=2, gaussian_idx=gaussian_idx
-                            )
-                    
-                    # Logging pause for single point
-                    if self.log_to_rerun and len(gaussian_indices) == 1:
-                        input("Pause: press a key to continue")
-            
+                        # Apply consensus rule
+                        consensus_id = self.apply_consensus_rule(votes)
+                        
+                        image, _, _, _ = render_single_gaussian(camera, gaussians, gaussian_idx=gaussian_idx)
+                        if not isinstance(image, np.ndarray):
+                            image = image.detach().cpu().numpy()
+                            image = np.transpose(image, (1, 2, 0))
+                        if image.dtype != np.uint8:
+                            image = np.clip(image * 255, 0, 255).astype(np.uint8)
+                        if image.ndim == 2:
+                            image = np.stack([image]*3, axis=-1)  # Make grayscale 3-channel
+                        if image.shape[2] == 1:
+                            image = np.repeat(image, 3, axis=2)
+                        image = np.ascontiguousarray(image)
+    
+                        # Obtain mask from image
+                        splat_binary_mask = np.any(image != 0, axis=2)
+                        mask_id = -1
+                        if np.count_nonzero(splat_binary_mask):
+                            mask_id = self._get_most_common_id_in_mask(refined_mask, splat_binary_mask)
+                        if mask_id != consensus_id and consensus_id >= 0:
+                            print(f"Updating mask for camera {cam_idx} for Gaussian {gaussian_idx} with consensus ID {consensus_id} (replacing {mask_id})")
+                            refined_mask[sam_level, splat_binary_mask] = consensus_id
             refined_masks.append(refined_mask)
         
         return refined_masks
+    
+    def _get_most_common_id_in_mask(self, image: torch.Tensor, mask: torch.Tensor, channel: int = 0) -> int:
+        """
+        Given an image [C, H, W] and a binary mask [H, W], return the most common ID
+        at the specified channel inside the masked region.
+
+        Args:
+            image (torch.Tensor): Input tensor of shape [C, H, W].
+            mask (torch.Tensor): Binary mask of shape [H, W].
+            channel (int): Channel index containing semantic IDs.
+
+        Returns:
+            int: Most common ID value inside the mask.
+        """
+        # Extract the semantic ID map from the specified channel
+        id_map = image[channel]  # [H, W]
+
+        # Apply mask
+        masked_ids = id_map[mask.astype(bool)]
+
+        if masked_ids.numel() == 0:
+            return -1  # No valid IDs in mask
+
+        # Find most common ID
+        ids, counts = torch.unique(masked_ids, return_counts=True)
+        most_common_id = ids[counts.argmax()].item()
+
+        return most_common_id
