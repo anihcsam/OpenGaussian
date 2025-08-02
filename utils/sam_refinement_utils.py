@@ -988,7 +988,7 @@ class MultiViewSAMMaskRefiner:
         # Logging only for first point if enabled and batch size is 1
         if self.log_to_rerun and N == 1 and gaussian_indices is not None:
             rr.log(f"gs_{gaussian_indices[0]}/camera_{index_cam}/camera_pose/gs_in_cam", 
-                rr.Points3D(points_camera[0, :3], radii=0.01, colors=[0, 0, 255]))
+                rr.Points3D(points_camera[0, :3].cpu(), radii=0.01, colors=[0, 0, 255]))
         
         # Apply projection matrix to map to clip space
         points_clip = (camera.projection_matrix_no_t @ points_camera.T).T  # (N, 4)
@@ -1013,7 +1013,6 @@ class MultiViewSAMMaskRefiner:
         
         DEPTH_DIFF_THRESHOLD = 0.15 # 15cm
         DIST_OPTICAL_CENTER_IMAGE = 0.1 # 10cm (took from rerun image metadata)
-        device = 'cuda:0'
         if use_depth==True:
             # print(f"Visibility before depth check: {visible}")
             u_int = u.cpu().numpy().astype(int)
@@ -1028,8 +1027,10 @@ class MultiViewSAMMaskRefiner:
             diff = points_3d.cpu().numpy() - t  # shape: (N, 3)
             dist_image_point = np.linalg.norm(diff, axis=1) - DIST_OPTICAL_CENTER_IMAGE  # shape: (N,)
             # dist_image_point = np.linalg.norm(points_3d.cpu().numpy() - t) - DIST_OPTICAL_CENTER_IMAGE
-            rendered_depth = camera.depth_map[:, v_int, u_int].detach().cpu().numpy()    
-            visible_depth = torch.abs(torch.from_numpy(dist_image_point).to(device) - torch.from_numpy(rendered_depth).to(device)) < DEPTH_DIFF_THRESHOLD
+            rendered_depth = camera.depth_map[:, v_int, u_int].detach()  
+            visible_depth = (
+                torch.abs(torch.from_numpy(dist_image_point).to(rendered_depth.device) - rendered_depth) < DEPTH_DIFF_THRESHOLD
+            )
             visible = visible & visible_depth
             
             if self.log_to_rerun:
@@ -1369,8 +1370,13 @@ class MultiViewSAMMaskRefiner:
         original_mask = sam_masks[cam_idx].clone()
         refined_mask = original_mask.clone()
         
+        num_gaussians = gaussians.get_xyz.shape[0]
+        gaussian_indices = None # [31879]
+        splat_camera_correspondence = torch.empty(
+            (len(gaussian_indices) if gaussian_indices is not None else num_gaussians, len(cameras)), dtype=torch.bool)
+   
         if self.log_to_rerun:
-            rr.init("sam_refinement", spawn=True)
+            rr.init("Sam_Refinement_Multistage", spawn=True)
             rr.log(
                 "world_frame",
                 rr.Arrows3D(
@@ -1379,39 +1385,18 @@ class MultiViewSAMMaskRefiner:
                 ),
             )
             rr.log(f"gaussian_pointcloud", rr.Points3D(gaussians.get_xyz.cpu(), radii=0.005, colors=[0, 255, 0]))
-        
-        # Process Gaussians in batches for GPU parallelization
-        # Sample subset of Gaussians for efficiency (every 10th Gaussian)
-        sample_step = 1
-        num_gaussians = gaussians.get_xyz.shape[0]
-        batch_size = gaussians.get_xyz.shape[0]
-        
-        splat_camera_correspondence = torch.empty((1, len(cameras)), dtype=torch.bool)   
-             
-        for batch_start in range(0, num_gaussians, batch_size * sample_step):
-            batch_end = min(batch_start + batch_size * sample_step, num_gaussians)
-            
-            # Get batch of Gaussian indices
-            # gaussian_indices = list(range(batch_start, batch_end, sample_step))
-            gaussian_indices = [31879]
-            if not gaussian_indices:
-                continue
-                
-            # Extract batch of 3D positions
-            batch_gaussians_3d = gaussians.get_xyz[gaussian_indices]  # (batch_size, 3)
-            
+            if gaussian_indices is not None:
+                rr.log(f"selected_splats", rr.Points3D(gaussians.get_xyz[gaussian_indices].cpu(), radii=0.01, colors=[255, 0, 0]))
+
+        for cam_idx, camera in tqdm(enumerate(cameras), total=len(cameras), desc="Writing splat to cam correspondence"):
+            # Project batch to current camera
+            _, _, visible_curr = self.project_3d_points_to_image_batch(
+                camera=camera, gaussians=gaussians, gaussian_indices=gaussian_indices, use_depth=True
+            )
             if self.log_to_rerun:
-                rr.log(f"gs_selected", rr.Points3D(batch_gaussians_3d.cpu(), radii=0.01, colors=[255, 0, 0]))
-            
-            for cam_idx, camera in tqdm(enumerate(cameras), total=len(cameras), desc="Writing splat to cam correspondence"):
-                # Project batch to current camera
-                u_curr, v_curr, visible_curr = self.project_3d_points_to_image_batch(
-                    camera=camera, gaussians=gaussians, gaussian_indices=gaussian_indices, use_depth=True
-                )
-                if self.log_to_rerun:
-                    input("Pause: press a key to continue")
-                    
-                splat_camera_correspondence[:, cam_idx] = visible_curr
+                input("Pause: press a key to continue")
+                
+            splat_camera_correspondence[:, cam_idx] = visible_curr
                 
         if self.log_to_rerun:
             print(f"matrix: \n{splat_camera_correspondence}")
