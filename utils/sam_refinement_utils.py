@@ -961,7 +961,7 @@ class MultiViewSAMMaskRefiner:
         return refined_masks
 
 
-    def project_3d_points_to_image_batch(self, points_3d, camera: Camera, gaussian_indices=None, index_cam=0, use_depth=False):
+    def project_3d_points_to_image_batch(self, camera: Camera, gaussians: GaussianModel, gaussian_indices=None, index_cam=0, use_depth=False):
         """
         Project batch of 3D points in world coordinates into 2D image pixel coordinates.
         
@@ -975,6 +975,7 @@ class MultiViewSAMMaskRefiner:
         - u, v (torch.Tensor): pixel coordinates of shape (N,) each
         - visible (torch.Tensor): boolean mask of shape (N,) indicating visibility
         """
+        points_3d = gaussians.get_xyz[gaussian_indices] if gaussian_indices is not None else gaussians.get_xyz
         N = points_3d.shape[0]
         
         # Convert points to homogeneous coordinates (add a fourth '1' coordinate)
@@ -1010,40 +1011,76 @@ class MultiViewSAMMaskRefiner:
         visible = is_in_front & in_bounds  # (N,)
         
         
-        DEPTH_DIFF_THRESHOLD = 0.3 # 30cm
-        if visible and use_depth==True:
+        DEPTH_DIFF_THRESHOLD = 0.15 # 15cm
+        DIST_OPTICAL_CENTER_IMAGE = 0.1 # 10cm (took from rerun image metadata)
+        device = 'cuda:0'
+        if use_depth==True:
+            # print(f"Visibility before depth check: {visible}")
+            u_int = u.cpu().numpy().astype(int)
+            v_int = v.cpu().numpy().astype(int)
+            
+            # TODO: despaxx this setting to zero
+            u_int[~visible.cpu().numpy()] = 0
+            v_int[~visible.cpu().numpy()] = 0
+            
             cam2world = np.linalg.inv(camera.world_view_transform_no_t.cpu().numpy())
             t = cam2world[:3, 3]
-            R = cam2world[:3, :3]
-            rot_q = mat_to_quat(torch.from_numpy(R).unsqueeze(0)).squeeze(0).numpy()
-            K = camera.intrinsic_matrix.cpu().numpy()
-            image = camera.original_image.cpu().numpy().transpose(1, 2, 0)
-            if image.dtype != np.uint8:
-                image = np.clip(image * 255, 0, 255).astype(np.uint8)
-            cv2.circle(image, (int(u[0]), int(v[0])), radius=5, color=(255, 0, 0), thickness=-1)
-            log_camera_pose(
-                f"gs/camera",
-                t,
-                np.array([rot_q[0], rot_q[1], rot_q[2], rot_q[3]]),
-                K,
-                camera.image_width,
-                camera.image_height,
-                image=image,
-            )
-            rr.log(
-                f"trajectory_segment",
-                rr.LineStrips3D(
-                    [t.tolist(), points_3d[0].tolist()],
-                    colors=[0, 255, 255],
-                    radii=0.002,
-                    # labels=[line_label],
-                ),
-            )
-            print(f"Euclidean distance (from optical center) = {np.linalg.norm(points_3d[0].cpu().numpy() - t)}")
-            print(f"Euclidean distance (from aprox image plane) = {np.linalg.norm(points_3d[0].cpu().numpy() - t) - 0.1}")
-            print(f"Rendered depth ({int(u[0])},{int(v[0])}) = {camera.depth_map[:, int(v[0]), int(u[0])].item()}") # shape 1,H,W     
-            visible = False
-        
+            diff = points_3d.cpu().numpy() - t  # shape: (N, 3)
+            dist_image_point = np.linalg.norm(diff, axis=1) - DIST_OPTICAL_CENTER_IMAGE  # shape: (N,)
+            # dist_image_point = np.linalg.norm(points_3d.cpu().numpy() - t) - DIST_OPTICAL_CENTER_IMAGE
+            rendered_depth = camera.depth_map[:, v_int, u_int].detach().cpu().numpy()    
+            visible_depth = torch.abs(torch.from_numpy(dist_image_point).to(device) - torch.from_numpy(rendered_depth).to(device)) < DEPTH_DIFF_THRESHOLD
+            visible = visible & visible_depth
+            
+            if self.log_to_rerun:
+                print(f"Euclidean distance (from aprox image plane) = {dist_image_point}, shape: {dist_image_point.shape}")
+                print(f"Rendered depth ({int(u[0])},{int(v[0])}) = {rendered_depth}, shape: {rendered_depth.shape}") # shape 1,H,W 
+                print(f"After depth chekcing: {visible_depth}, total verdict: {visible}")
+
+            if self.log_to_rerun == True and visible.flatten().any() == True:
+                image = camera.original_image.cpu().numpy().transpose(1, 2, 0)
+                all_splat_masks = np.zeros_like(image[:, :, 0])
+                # print(f"shape all masks {all_splat_masks.shape}")
+                for i, gaussian_idx in enumerate(gaussian_indices):
+                    if visible.flatten()[i] == True:
+                        rendered_image, radii, _, _ = render_single_gaussian(camera, gaussians, gaussian_idx=gaussian_idx)
+                        rendered_image = fix_image(rendered_image)
+                        # Get mask for the single gaussian
+                        non_black_mask = np.any(rendered_image != 0, axis=2)
+                        num_non_black_pixels = np.count_nonzero(non_black_mask)
+                        covariance_matrix = gaussians.get_covariance_full_matrix()[gaussian_idx]
+                        # print(f"splat ID = {gaussian_idx}):"
+                        #     f"\n   non-black:{num_non_black_pixels},"
+                        #     f"\n   opacity:{gaussians.get_opacity[gaussian_idx].item()},"
+                        #     #   f"\n   cov:\n{covariance_matrix},"
+                        #     #   f"\n   eigs:\n{torch.linalg.eigvals(covariance_matrix)},"
+                        #     f"\n   radii value: {radii.item()}")
+                    
+                        rr.log(
+                            f"trajectory_segment_{gaussian_idx}",
+                            rr.LineStrips3D(
+                                [t.tolist(), points_3d[i].tolist()],
+                                colors=[0, 255, 255],
+                                radii=0.002,
+                            ),
+                        )
+                        all_splat_masks = np.logical_or(all_splat_masks, non_black_mask)
+                R = cam2world[:3, :3]
+                rot_q = mat_to_quat(torch.from_numpy(R).unsqueeze(0)).squeeze(0).numpy()
+                K = camera.intrinsic_matrix.cpu().numpy()
+                if image.dtype != np.uint8:
+                    image = np.clip(image * 255, 0, 255).astype(np.uint8)
+                # cv2.circle(image, (int(u[0]), int(v[0])), radius=5, color=(255, 0, 0), thickness=-1)
+                image[all_splat_masks] = (227,114,34)
+                log_camera_pose(
+                    f"gs/camera",
+                    t,
+                    np.array([rot_q[0], rot_q[1], rot_q[2], rot_q[3]]),
+                    K,
+                    camera.image_width,
+                    camera.image_height,
+                    image=image,
+                )       
         return u, v, visible
 
     def collect_mask_votes_batch(self, points_3d, overlapping_cam_indices, cameras, sam_masks, 
@@ -1324,17 +1361,13 @@ class MultiViewSAMMaskRefiner:
         
         refined_masks = []
         
+        # Write depth map to camera instance.
         for cam_idx, camera in tqdm(enumerate(cameras), total=len(cameras), desc="Writing depth maps to camera frames"):
             _, _, rendered_depth, _ = render_gaussians_with_exclusion(camera, gaussians, exclude_indices=None)
             camera.depth_map = rendered_depth
-            # print(f"Writing depth map of shape {rendered_depth.shape}")
                 
         original_mask = sam_masks[cam_idx].clone()
         refined_mask = original_mask.clone()
-        
-        # Sample subset of Gaussians for efficiency (every 10th Gaussian)
-        sample_step = 1
-        num_gaussians = gaussians.get_xyz.shape[0]
         
         if self.log_to_rerun:
             rr.init("sam_refinement", spawn=True)
@@ -1348,67 +1381,40 @@ class MultiViewSAMMaskRefiner:
             rr.log(f"gaussian_pointcloud", rr.Points3D(gaussians.get_xyz.cpu(), radii=0.005, colors=[0, 255, 0]))
         
         # Process Gaussians in batches for GPU parallelization
-        batch_size = 50000 if not self.log_to_rerun else 1  # Use batch size 1 for logging
+        # Sample subset of Gaussians for efficiency (every 10th Gaussian)
+        sample_step = 1
+        num_gaussians = gaussians.get_xyz.shape[0]
+        batch_size = gaussians.get_xyz.shape[0]
         
+        splat_camera_correspondence = torch.empty((1, len(cameras)), dtype=torch.bool)   
+             
         for batch_start in range(0, num_gaussians, batch_size * sample_step):
             batch_end = min(batch_start + batch_size * sample_step, num_gaussians)
             
             # Get batch of Gaussian indices
             # gaussian_indices = list(range(batch_start, batch_end, sample_step))
-            # gaussian_indices = [28997]
-            gaussian_indices = [30240]
+            gaussian_indices = [31879]
             if not gaussian_indices:
                 continue
                 
             # Extract batch of 3D positions
             batch_gaussians_3d = gaussians.get_xyz[gaussian_indices]  # (batch_size, 3)
             
-            # Logging for single point
-            if self.log_to_rerun and len(gaussian_indices) == 1:
-                gaussian_3d_cpu = batch_gaussians_3d[0].cpu()
-                rr.log(f"gs_{gaussian_indices[0]}", rr.Points3D(gaussian_3d_cpu, radii=0.01, colors=[255, 0, 0]))
+            if self.log_to_rerun:
+                rr.log(f"gs_selected", rr.Points3D(batch_gaussians_3d.cpu(), radii=0.01, colors=[255, 0, 0]))
             
-            for camera in cameras:
+            for cam_idx, camera in tqdm(enumerate(cameras), total=len(cameras), desc="Writing splat to cam correspondence"):
                 # Project batch to current camera
                 u_curr, v_curr, visible_curr = self.project_3d_points_to_image_batch(
-                    batch_gaussians_3d, camera, use_depth=True
+                    camera=camera, gaussians=gaussians, gaussian_indices=gaussian_indices, use_depth=True
                 )
                 if self.log_to_rerun:
-                    # Transform from world frame to camera frame (inverse transform)
-                    if self.log_to_rerun and len(gaussian_indices) == 1:
-                        input("Pause: press a key to continue")
-                # print(f"Intrinsics\n{K}")
-            
-            # # Process each point in the batch
-            # for i, (gaussian_idx, votes) in enumerate(zip(gaussian_indices, votes_list)):
-            #     if not votes:
-            #         continue
+                    input("Pause: press a key to continue")
                     
-            #     # Apply consensus rule
-            #     consensus_id = self.apply_consensus_rule(votes)
+                splat_camera_correspondence[:, cam_idx] = visible_curr
                 
-            #     if visible_curr[i] and consensus_id >= 0:
-            #         x_curr, y_curr = int(u_curr[i].item()), int(v_curr[i].item())
-                    
-            #         # Update mask
-            #         H, W = refined_mask.shape[1], refined_mask.shape[2]
-            #         changes_made = 0
-                    
-            #         if 0 <= y_curr < H and 0 <= x_curr < W:
-            #             if refined_mask[sam_level, y_curr, x_curr] != consensus_id:
-            #                 refined_mask[sam_level, y_curr, x_curr] = consensus_id
-            #                 changes_made += 1
-                    
-            #         # Debug visualization for single point
-            #         if self.visualize_matches and changes_made > 0:
-            #             self.debug_visualize_projections(
-            #                 batch_gaussians_3d[i], votes, consensus_id, cameras, sam_masks, 
-            #                 sam_level, current_cam_idx=cam_idx, max_pairs=2, gaussian_idx=gaussian_idx
-            #             )
-                
-            # Logging pause for single point
-            if self.log_to_rerun and len(gaussian_indices) == 1:
-                input("Pause: press a key to continue")
-            refined_masks.append(refined_mask)
+        if self.log_to_rerun:
+            print(f"matrix: \n{splat_camera_correspondence}")
+            input("Pause: press a key to continue")
         
         return refined_masks

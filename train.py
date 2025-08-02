@@ -413,14 +413,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             # Disable vectorization when logging
             if log_to_rerun or visualize_matches:
-                refined_sam_masks = refiner.refine_sam_masks(
+                refined_sam_masks = refiner.refine_sam_masks_multistage(
                     cameras_to_refine, 
                     original_sam_masks, 
                     scene.gaussians, 
                     sam_level=sam_level
                 )
             else:
-                refined_sam_masks = refiner.refine_sam_masks_batch(
+                refined_sam_masks = refiner.refine_sam_masks_multistage(
                     cameras_to_refine, 
                     original_sam_masks, 
                     scene.gaussians, 
@@ -1067,7 +1067,7 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
+    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), \
              args.test_iterations, args.save_iterations, args.checkpoint_iterations, \

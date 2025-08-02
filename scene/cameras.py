@@ -79,6 +79,8 @@ class Camera(nn.Module):
         self.intrinsic_matrix = getCameraToPixelMatrix(
             self.image_width, self.image_height, self.FoVx, self.FoVy, self.cx, self.cy)
         
+        self.depth_map = None
+        
     # modify -----
     def to_gpu(self):
         for attr_name in dir(self):
