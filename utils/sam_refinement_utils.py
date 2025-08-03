@@ -1404,4 +1404,64 @@ class MultiViewSAMMaskRefiner:
             print(f"matrix: \n{splat_camera_correspondence}")
             input("Pause: press a key to continue")
         
+
+        print(f"splat_camera_correspondence.shape: {splat_camera_correspondence.shape}")
+        for gaussian_id, splat_visibility_in_cams in enumerate(splat_camera_correspondence):
+            for i, camera in enumerate(cameras):
+                if splat_visibility_in_cams[i]:
+                    rendered_image, _, _, _ = render_single_gaussian(camera, gaussians, gaussian_id)
+                    rendered_image = fix_image(rendered_image)  # Convert to proper format
+                    non_black_mask = np.any(rendered_image != 0, axis=2)
+
+                    if not non_black_mask.any():
+                        print("Nothing rendered. Skipping...")
+                        continue
+                    
+                    # Fix the mask extraction - get the SAM mask channel first
+                    sam_mask_channel = sam_masks[i][sam_level].cpu().numpy()  # [H, W]
+                    rendered_ids = sam_mask_channel * non_black_mask.astype(int)  # Fixed: use multiplication
+                    
+                    # Create RGB visualizations
+                    plt.figure(figsize=(20, 5))
+
+                    # 1. Original SAM mask as RGB
+                    plt.subplot(1, 4, 1)
+                    img = camera.original_sam_mask.cpu().numpy().transpose(1, 2, 0)[:, :, 0]
+                    plt.imshow(img)
+                    plt.title(f'SAM Mask - Camera {i}')
+                    plt.axis('off')
+
+                    # 2. Rendered IDs as RGB
+                    plt.subplot(1, 4, 2)
+                    rendered_ids_rgb = plt.cm.tab10(rendered_ids / 10.0)[:, :, :3]  # Convert to RGB
+                    plt.imshow(rendered_ids_rgb)
+                    plt.title(f'Rendered IDs - Gaussian {gaussian_id}')
+                    plt.axis('off')
+
+                    # 3. Non-black mask (Gaussian footprint binary)
+                    plt.subplot(1, 4, 3)
+                    plt.imshow(non_black_mask, cmap='gray')
+                    plt.title(f'Non-black Mask\n(Gaussian Footprint)')
+                    plt.axis('off')
+
+                    # 4. Gaussian footprint (original rendered image)
+                    plt.subplot(1, 4, 4)
+                    plt.imshow(rendered_image)
+                    plt.title(f'Gaussian Footprint\n(Rendered Image)')
+                    plt.axis('off')
+
+                    plt.suptitle(f'Gaussian {gaussian_id} in Camera {i}', fontsize=16)
+                    plt.tight_layout()
+                    plt.show()
+
+                    # Print info
+                    unique_sam_ids = np.unique(sam_mask_channel[sam_mask_channel > 0])
+                    unique_rendered_ids = np.unique(rendered_ids[rendered_ids > 0])
+                    print(f"Gaussian {gaussian_id}, Camera {i}:")
+                    print(f"  SAM mask unique IDs: {unique_sam_ids}")
+                    print(f"  Rendered IDs: {unique_rendered_ids}")
+                    print(f"  Footprint pixels: {np.count_nonzero(non_black_mask)}")
+                    print("-" * 50)
+                    # exit()    
+
         return refined_masks
