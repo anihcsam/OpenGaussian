@@ -17,6 +17,61 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
 
+import numpy as np
+
+def save_weight_map_to_csv(weight_map: torch.Tensor, filename="weight_map.csv"):
+    """
+    Save a weight map to a CSV file.
+    
+    Args:
+        weight_map: Weight map with shape [H, W, 1] or [H, W] as torch.Tensor
+        filename: Output CSV filename
+    """
+    # Convert to numpy if it's a torch tensor
+    if isinstance(weight_map, torch.Tensor):
+        weight_map = weight_map.detach().cpu().numpy()
+    
+    # If weight_map has shape [H, W, 1], squeeze to [H, W]
+    if weight_map.ndim == 3 and weight_map.shape[2] == 1:
+        weight_map = np.squeeze(weight_map, axis=2)
+    
+    # Save to CSV without headers or row indices
+    np.savetxt(filename, weight_map, delimiter=",", fmt="%.6f")
+    
+    print(f"Saved weight map of shape {weight_map.shape} to {filename}")
+
+def rgb_to_weight_map(rendered_image: torch.Tensor) -> torch.Tensor:
+    """
+    Convert RGB splat render to a weight map (1 for white, 0 for black),
+    normalized so the maximum value is exactly 1.0.
+    
+    Args:
+        rendered_image: RGB image with shape [H, W, 3]
+        
+    Returns:
+        weight_map: Single channel weight map with shape [H, W, 1] as torch.Tensor
+    """
+    # Convert to torch tensor if it's numpy
+    if isinstance(rendered_image, np.ndarray):
+        rendered_image = torch.from_numpy(rendered_image).float()
+    
+    # Normalize to 0-1 if needed
+    if rendered_image.max() > 1.0:
+        rendered_image = rendered_image / 255.0
+    
+    # Method 2: Average RGB channels
+    weight_map = torch.mean(rendered_image, dim=2)
+    
+    # Normalize by maximum value to ensure max is exactly 1.0
+    max_val = weight_map.max()
+    if max_val > 0:  # Avoid division by zero
+        weight_map = weight_map / max_val
+    
+    # Add singleton dimension to get [H, W, 1]
+    weight_map = weight_map.unsqueeze(2)
+    
+    return weight_map
+
 def save_images_and_difference(img1, img2, x, y, filename="comparison.png", title1="Image all", title2="Image exclude"):
     # Pixelwise absolute difference
     diff = np.abs(img1.astype(np.int16) - img2.astype(np.int16)).astype(np.uint8)
@@ -211,7 +266,7 @@ def log_camera_pose(
 from scene.gaussian_model import GaussianModel
 from ashawkey_diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from utils.sh_utils import eval_sh
-def render_single_gaussian(viewpoint_camera, pc: GaussianModel, gaussian_idx: int, scaling_modifier=1.0, **kwargs):
+def render_single_gaussian(viewpoint_camera, pc: GaussianModel, gaussian_idx: int, scaling_modifier=1.0, use_view_inv_white_shs: bool = False, **kwargs):
     """
     Render only a single Gaussian splat at the specified index from the model.
     """
@@ -260,6 +315,13 @@ def render_single_gaussian(viewpoint_camera, pc: GaussianModel, gaussian_idx: in
             colors_precomp = colors_precomp[gaussian_idx:gaussian_idx+1]
         elif colors_precomp.ndim == 1:
             colors_precomp = colors_precomp.unsqueeze(0)
+    print(f"shs is of shape {shs.shape}")
+    features_dc = torch.ones((1, 1, 3), dtype=torch.float32, device=shs.device)
+    features_rest = torch.zeros((1, 15, 3), dtype=torch.float32, device=shs.device)
+    shs_white_dir_inv = torch.cat((features_dc, features_rest), dim=1)
+    
+    if use_view_inv_white_shs:
+        shs = shs_white_dir_inv
 
     # Rasterize only this Gaussian
     rendered_image, radii, rendered_depth, rendered_alpha = rasterizer(
@@ -1036,7 +1098,7 @@ class MultiViewSAMMaskRefiner:
             
             if self.log_to_rerun:
                 print(f"Euclidean distance (from aprox image plane) = {dist_image_point}, shape: {dist_image_point.shape}")
-                print(f"Rendered depth ({int(u[0])},{int(v[0])}) = {rendered_depth}, shape: {rendered_depth.shape}") # shape 1,H,W 
+                print(f"Rendered depth (u={int(u[0])},v={int(v[0])}) = {rendered_depth}, shape: {rendered_depth.shape}") # shape 1
                 print(f"After depth chekcing: {visible_depth}, total verdict: {visible}")
 
             if self.log_to_rerun == True and visible.flatten().any() == True:
@@ -1045,8 +1107,12 @@ class MultiViewSAMMaskRefiner:
                 # print(f"shape all masks {all_splat_masks.shape}")
                 for i, gaussian_idx in enumerate(gaussian_indices):
                     if visible.flatten()[i] == True:
-                        rendered_image, radii, _, _ = render_single_gaussian(camera, gaussians, gaussian_idx=gaussian_idx)
+                        rendered_image, radii, _, _ = render_single_gaussian(camera, gaussians, gaussian_idx=gaussian_idx, use_view_inv_white_shs=True)
                         rendered_image = fix_image(rendered_image)
+                        
+                        weight_map = rgb_to_weight_map(rendered_image)
+                        save_weight_map_to_csv(weight_map, filename="test.csv")
+                        
                         # Get mask for the single gaussian
                         non_black_mask = np.any(rendered_image != 0, axis=2)
                         num_non_black_pixels = np.count_nonzero(non_black_mask)
@@ -1331,6 +1397,45 @@ class MultiViewSAMMaskRefiner:
         
         return refined_masks
     
+    def _get_most_common_id_in_mask_weighted(self, sam_mask: torch.Tensor, weight_matrix: torch.Tensor) -> int:
+        """
+        Find the most dominant ID in an image based on weighted counts.
+        
+        Args:
+            sam_mask: torch.Tensor with shape [H, W] containing ID values
+            weight_matrix: torch.Tensor with shape [H, W] containing weights for each pixel
+            
+        Returns:
+            int: The ID with the highest weighted sum
+        """
+        # Flatten both tensors for easier processing
+        sam_mask_flat = sam_mask.flatten()
+        weights_flat = weight_matrix.flatten()
+        
+        # Create a dictionary to accumulate weighted counts
+        weighted_counts = {}
+        
+        # Accumulate weights for each ID
+        for id_val, weight in zip(sam_mask_flat, weights_flat):
+            id_key = id_val.item()  # Convert tensor to Python int
+            weight_val = weight.item()  # Convert tensor to Python float
+            
+            if id_key not in weighted_counts:
+                weighted_counts[id_key] = 0.0
+            weighted_counts[id_key] += weight_val
+        
+        # Find the ID with maximum weighted count
+        if not weighted_counts:
+            return -100  # No valid IDs
+        
+        most_common_id = max(weighted_counts, key=weighted_counts.get)
+        max_weight = weighted_counts[most_common_id]
+        
+        if self.log_to_rerun:
+            print(f"Most dominant ID: {most_common_id} with weighted count: {max_weight:.3f}"
+                f"\n keys {weighted_counts.keys()}")
+        return most_common_id
+    
     def _get_most_common_id_in_mask(self, image: torch.Tensor, mask: torch.Tensor, channel: int = 0) -> int:
         """
         Given an image [C, H, W] and a binary mask [H, W], return the most common ID
@@ -1485,7 +1590,7 @@ class MultiViewSAMMaskRefiner:
     
     def refine_sam_masks_multistage(self, cameras: list[Camera], sam_masks, gaussians, sam_level=0):
         
-        refined_masks = torch.empty_like(sam_masks)
+        refined_masks = [mask.clone() if mask is not None else None for mask in sam_masks]
         
         # Write depth map to camera instance.
         for cam_idx, camera in tqdm(enumerate(cameras), total=len(cameras), desc="Writing depth maps to camera frames"):
@@ -1496,7 +1601,7 @@ class MultiViewSAMMaskRefiner:
         refined_mask = original_mask.clone()
         
         num_gaussians = gaussians.get_xyz.shape[0]
-        gaussian_indices = None # [31879]
+        gaussian_indices = [31879]
         splat_camera_correspondence = torch.empty(
             (len(gaussian_indices) if gaussian_indices is not None else num_gaussians, len(cameras)), dtype=torch.bool)
    
@@ -1535,9 +1640,11 @@ class MultiViewSAMMaskRefiner:
             masks = []  # contains triples of sam_mask and  its id and its corresponding render
             for i, camera in enumerate(cameras):
                 if splat_visibility_in_cams[i]:
-                    rendered_image, _, _, _ = render_single_gaussian(camera, gaussians, gaussian_id)
+                    rendered_image, _, _, _ = render_single_gaussian(camera, gaussians, gaussian_id, use_view_inv_white_shs=True)
                     rendered_image = fix_image(rendered_image)  # Convert to proper format
                     non_black_mask = np.any(rendered_image != 0, axis=2)
+                    weights_mask = rgb_to_weight_map(rendered_image)
+                    most_dominant_id = self._get_most_common_id_in_mask_weighted(sam_mask=sam_masks[i][sam_level], weight_matrix=weights_mask)
 
                     if not non_black_mask.any():
                         # print("Nothing rendered. Skipping...")
