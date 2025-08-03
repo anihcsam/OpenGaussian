@@ -315,7 +315,6 @@ def render_single_gaussian(viewpoint_camera, pc: GaussianModel, gaussian_idx: in
             colors_precomp = colors_precomp[gaussian_idx:gaussian_idx+1]
         elif colors_precomp.ndim == 1:
             colors_precomp = colors_precomp.unsqueeze(0)
-    print(f"shs is of shape {shs.shape}")
     features_dc = torch.ones((1, 1, 3), dtype=torch.float32, device=shs.device)
     features_rest = torch.zeros((1, 15, 3), dtype=torch.float32, device=shs.device)
     shs_white_dir_inv = torch.cat((features_dc, features_rest), dim=1)
@@ -1464,94 +1463,134 @@ class MultiViewSAMMaskRefiner:
 
         return most_common_id
     
+    def plot_masks(self, camera, rendered_ids, gaussian_id, sam_mask_channel, rendered_image, non_black_mask, camera_idx, original_sam_masks):
+        # Use the same color scheme as in train.py
+        np.random.seed(42)
+        colors_defined = np.random.randint(100, 256, size=(300, 3))
+        colors_defined[0] = np.array([0, 0, 0])  # Ignore the mask ID of -1 and set it to black.
+        colors_defined = torch.from_numpy(colors_defined)
+        
+        # Create visualizations
+        plt.figure(figsize=(30, 5))
 
-    def plot_masks(camera, rendered_ids, gaussian_id, sam_mask_channel, rendered_image, non_black_mask):
-        # Create RGB visualizations
-        plt.figure(figsize=(20, 5))
-
-        # 1. Original SAM mask as RGB
-        plt.subplot(1, 4, 1)
-        img = camera.original_sam_mask.cpu().numpy().transpose(1, 2, 0)[:, :, 0]
-        plt.imshow(img)
-        plt.title(f'SAM Mask - Camera {i}')
+        # 1. Original SAM mask - using predefined colors
+        plt.subplot(1, 6, 1)
+        original_img = original_sam_masks[camera_idx][0].cpu().numpy()
+        original_mask_colored = colors_defined[original_img.astype(int).clip(0, 299)].numpy()
+        original_mask_colored = original_mask_colored.transpose(2, 0, 1)  # [H, W, 3] -> [3, H, W]
+        plt.imshow(original_mask_colored.transpose(1, 2, 0))  # [3, H, W] -> [H, W, 3]
+        plt.title(f'Original SAM Mask - Camera {camera_idx}')
         plt.axis('off')
 
-        # 2. Rendered IDs as RGB
-        plt.subplot(1, 4, 2)
-        # rendered_ids_rgb = plt.cm.tab10( / 10.0)[:, :, :3]  # Convert to RGB
-        plt.imshow(rendered_ids)
+        # 2. Refined SAM mask - using predefined colors
+        plt.subplot(1, 6, 2)
+        refined_img = sam_mask_channel  # This IS the refined mask!
+        refined_mask_colored = colors_defined[refined_img.astype(int).clip(0, 299)].numpy()
+        refined_mask_colored = refined_mask_colored.transpose(2, 0, 1)  # [H, W, 3] -> [3, H, W]
+        plt.imshow(refined_mask_colored.transpose(1, 2, 0))  # [3, H, W] -> [H, W, 3]
+        plt.title(f'Refined SAM Mask - Camera {camera_idx}')
+        plt.axis('off')
+
+        # 3. Rendered IDs - using predefined colors
+        plt.subplot(1, 6, 3)
+        rendered_mask_colored = colors_defined[rendered_ids.astype(int).clip(0, 299)].numpy()
+        rendered_mask_colored = rendered_mask_colored.transpose(2, 0, 1)  # [H, W, 3] -> [3, H, W]
+        plt.imshow(rendered_mask_colored.transpose(1, 2, 0))  # [3, H, W] -> [H, W, 3]
         plt.title(f'Rendered IDs - Gaussian {gaussian_id}')
         plt.axis('off')
 
-        # 3. Non-black mask (Gaussian footprint binary)
-        plt.subplot(1, 4, 3)
+        # 4. Non-black mask (Gaussian footprint binary)
+        plt.subplot(1, 6, 4)
         plt.imshow(non_black_mask, cmap='gray')
         plt.title(f'Non-black Mask\n(Gaussian Footprint)')
         plt.axis('off')
 
-        # 4. Gaussian footprint (original rendered image)
-        plt.subplot(1, 4, 4)
+        # 5. Gaussian footprint (original rendered image)
+        plt.subplot(1, 6, 5)
         plt.imshow(rendered_image)
         plt.title(f'Gaussian Footprint\n(Rendered Image)')
         plt.axis('off')
 
-        plt.suptitle(f'Gaussian {gaussian_id} in Camera {i}', fontsize=16)
+        # 6. Difference between original and refined masks
+        plt.subplot(1, 6, 6)
+        difference = np.abs(original_img.astype(np.float32) - refined_img.astype(np.float32))
+        plt.imshow(difference, cmap='hot', vmin=0, vmax=10)
+        plt.title(f'Mask Difference\n(Original vs Refined)')
+        plt.colorbar(label='ID Difference')
+        plt.axis('off')
+
+        plt.suptitle(f'Gaussian {gaussian_id} in Camera {camera_idx}', fontsize=16)
         plt.tight_layout()
         plt.show()
 
         # Print info
         unique_sam_ids = np.unique(sam_mask_channel[sam_mask_channel > 0])
         unique_rendered_ids = np.unique(rendered_ids[rendered_ids > 0])
-        print(f"Gaussian {gaussian_id}, Camera {i}:")
-        print(f"  SAM mask unique IDs: {unique_sam_ids}")
+        unique_original_ids = np.unique(original_img[original_img > 0])
+        unique_refined_ids = np.unique(refined_img[refined_img > 0])
+        
+        print(f"Gaussian {gaussian_id}, Camera {camera_idx}:")
+        print(f"  Original SAM mask unique IDs: {unique_original_ids}")
+        print(f"  Refined SAM mask unique IDs: {unique_refined_ids}")
+        print(f"  SAM mask channel unique IDs: {unique_sam_ids}")
         print(f"  Rendered IDs: {unique_rendered_ids}")
         print(f"  Footprint pixels: {np.count_nonzero(non_black_mask)}")
+        print(f"  Changed pixels: {np.count_nonzero(difference > 0)}")
         print("-" * 50)
 
 
-    def update_masks(self, gaussian_id: int, sam_masks: list, rendered_masks: list):
-        """
-        We assume a gaussian segments only a single object/instance
-        Currently, a gaussian can represent multiple objects/instances. We will change it
-        and update the sam masks under rendered gaussians to have the same ID(colour)
-        which is selected as the most common id among all masks for a single gaussian.
-        When updating other masks, we need to take into account that ID's corresponding to 
-        same objects are not necessarily consistent. Thus, we want to update with a new
-        and unique id. For this, we store global_ids. We could e.g., take the highest existing id + 1
-        to make it unique. When updating masks, we update corresponding id with new for all pixels.
 
-        Get most common id > 0 among all rendered masks corresponding to a gaussian
-        and update all the masks with that id:
-        single mask max id is updated by new global id > 0 that doesn't exist in other masks    
+    def future_voting():
+                # Step 2: Find the most common ID across ALL footprints
+        # most_common_id_all_masks = max(dominant_id_all_masks_counts, key=dominant_id_all_masks_counts.get)
+        # total_votes = dominant_id_all_masks_counts[most_common_id_all_masks]
+        
+        # print(f"  Most common ID in footprints: {most_common_id_all_masks} (total votes: {total_votes})")
+        # print(f"  All dominant_id_all_masks_counts ID counts: {dominant_id_all_masks_counts}")
+
+                # Step 1: Collect ALL IDs from rendered footprints across ALL cameras
+        # This counts how many times each ID appears in Gaussian footprints
+
+                
+        # for camera_idx, sam_mask_tensor, most_dominant_id in masks:
+        #     if most_dominant_id > 0:
+        #         if most_dominant_id not in dominant_id_all_masks_counts:
+        #             dominant_id_all_masks_counts[most_dominant_id] = 0
+        #         dominant_id_all_masks_counts[most_dominant_id] += 1
+            
+        #         print(f"  Camera {camera_idx}: most_dominant_id IDs {most_dominant_id} with counts {dominant_id_all_masks_counts[most_dominant_id]}")
+
+        pass
+
+
+
+    def update_masks(self, gaussian_id: int, masks: list, sam_masks: list, sam_level=0):
+        """
+        Find the most common ID within the Gaussian's rendered footprint across all cameras,
+        then update ALL pixels with that ID to a new global ID for consistency.
+
+        Args:
+            gaussian_id: ID of the current Gaussian
+            masks: list of tuples (camera_idx, sam_mask_tensor, most_dominant_id)
+            sam_masks: list of all SAM masks to be refined
+            sam_level: SAM level to use
+        
+        Returns:
+            refined_masks: updated list of SAM masks
         """
         
-        if not rendered_masks:
+        print(f"Type of sam_masks: {type(sam_masks[0])}")
+        
+        if not masks:
             return sam_masks  # No masks to process
-        
-        # Step 1: Collect all non-zero IDs from all rendered masks for this Gaussian
-        all_ids = []
-        for rendered_mask in rendered_masks:
-            unique_ids = np.unique(rendered_mask)
-            non_zero_ids = unique_ids[unique_ids > 0]  # Exclude background (ID=0)
-            all_ids.extend(non_zero_ids)
-        
-        if not all_ids:
-            return sam_masks  # No valid IDs found
-        
-        # Step 2: Find the most common non-zero ID across all masks for this Gaussian
-        unique_ids, counts = np.unique(all_ids, return_counts=True)
-        most_common_id = unique_ids[np.argmax(counts)]
-        
-        print(f"Gaussian {gaussian_id}: Most common ID = {most_common_id} (appeared {np.max(counts)} times)")
         
         # Step 3: Update global_ids set with all existing SAM mask IDs to track what's in use
         for sam_mask in sam_masks:
             if sam_mask is not None:
-                existing_ids = torch.unique(sam_mask)
+                existing_ids = torch.unique(sam_mask[sam_level])
                 self.global_ids.update(existing_ids[existing_ids > 0].cpu().numpy().tolist())
         
-        # Step 4: Generate a new unique global ID if we need to update masks
-        # Find the highest existing ID and add 1 to ensure uniqueness
+        # Step 4: Generate a new unique global ID
         if self.global_ids:
             new_global_id = max(self.global_ids) + 1
         else:
@@ -1560,51 +1599,55 @@ class MultiViewSAMMaskRefiner:
         # Add the new ID to our global set
         self.global_ids.add(new_global_id)
         
-        print(f"Assigned new global ID {new_global_id} for Gaussian {gaussian_id}")
+        print(f"  Assigned new global ID {new_global_id} for Gaussian {gaussian_id}")
         
-        # Step 5: Update all SAM masks where this Gaussian has a footprint
-        for i, rendered_mask in enumerate(rendered_masks):
-            if sam_masks[i] is None:
+        # Step 5: Update ALL pixels with the most common ID to the new global ID
+        # Create a copy of sam_masks to avoid modifying the original
+        refined_masks = [mask.clone() if mask is not None else None for mask in sam_masks]
+        
+        # Step 6: Update ALL cameras (not just affected ones) that have the most common ID
+        total_pixels_updated = 0
+                
+        for camera_idx, sam_mask_tensor, most_dominant_id in masks:
+            if refined_masks[camera_idx] is None:
                 continue
-                
-            # Create a mask where the Gaussian has a footprint (non-zero values in rendered_mask)
-            gaussian_footprint = rendered_mask > 0
             
-            if gaussian_footprint.any():
-                # Convert to tensor if needed
-                if isinstance(gaussian_footprint, np.ndarray):
-                    gaussian_footprint_tensor = torch.from_numpy(gaussian_footprint).to(sam_masks[i].device)
-                else:
-                    gaussian_footprint_tensor = gaussian_footprint
+            # Find ALL pixels with the most common ID in this camera's mask
+            # most_common_id_mask = (refined_masks[camera_idx][sam_level] == most_common_id_all_masks)
+            object_mask_of_dominant_id = (refined_masks[camera_idx][sam_level] == most_dominant_id)
+            pixels_before = torch.sum(object_mask_of_dominant_id).item()
+            
+            if pixels_before > 0:
+                # Update ALL pixels with the most common ID to the new global ID
+                refined_masks[camera_idx][sam_level][object_mask_of_dominant_id] = new_global_id
                 
-                # Update the SAM mask: set all pixels in Gaussian footprint to the new global ID
-                sam_masks[i][gaussian_footprint_tensor] = new_global_id
+                # Count pixels with new ID AFTER update
+                new_id_mask = (refined_masks[camera_idx][sam_level] == new_global_id)
+                pixels_after = torch.sum(new_id_mask).item()
                 
-                # Count how many pixels were updated
-                num_updated = torch.sum(gaussian_footprint_tensor).item()
-                print(f"  Updated {num_updated} pixels in camera {i} with new global ID {new_global_id}")
+                print(f"    Camera {camera_idx}: {pixels_before} pixels changed from ID {most_dominant_id} to {new_global_id}")
+                total_pixels_updated += pixels_before
         
-        return sam_masks
+        print(f"  Total pixels updated across all cameras: {total_pixels_updated}")
+        return refined_masks
 
 
-    
     def refine_sam_masks_multistage(self, cameras: list[Camera], sam_masks, gaussians, sam_level=0):
         
+        # Initialize refined_masks as a copy of original sam_masks
+        original_sam_masks = [mask.clone() if mask is not None else None for mask in sam_masks]
         refined_masks = [mask.clone() if mask is not None else None for mask in sam_masks]
         
         # Write depth map to camera instance.
         for cam_idx, camera in tqdm(enumerate(cameras), total=len(cameras), desc="Writing depth maps to camera frames"):
             _, _, rendered_depth, _ = render_gaussians_with_exclusion(camera, gaussians, exclude_indices=None)
             camera.depth_map = rendered_depth
-                
-        original_mask = sam_masks[cam_idx].clone()
-        refined_mask = original_mask.clone()
         
         num_gaussians = gaussians.get_xyz.shape[0]
-        gaussian_indices = [31879]
+        gaussian_indices = None
         splat_camera_correspondence = torch.empty(
             (len(gaussian_indices) if gaussian_indices is not None else num_gaussians, len(cameras)), dtype=torch.bool)
-   
+
         if self.log_to_rerun:
             rr.init("Sam_Refinement_Multistage", spawn=True)
             rr.log(
@@ -1619,7 +1662,6 @@ class MultiViewSAMMaskRefiner:
                 rr.log(f"selected_splats", rr.Points3D(gaussians.get_xyz[gaussian_indices].cpu(), radii=0.01, colors=[255, 0, 0]))
 
         for cam_idx, camera in tqdm(enumerate(cameras), total=len(cameras), desc="Writing splat to cam correspondence"):
-            # Project batch to current camera
             _, _, visible_curr = self.project_3d_points_to_image_batch(
                 camera=camera, gaussians=gaussians, gaussian_indices=gaussian_indices, use_depth=True
             )
@@ -1634,12 +1676,23 @@ class MultiViewSAMMaskRefiner:
             print(f"matrix: \n{splat_camera_correspondence}")
             input("Pause: press a key to continue")
         
-
         print(f"splat_camera_correspondence.shape: {splat_camera_correspondence.shape}")
+        
+        # Store visualization data for the first Gaussian AFTER processing
+        first_gaussian_viz_data = []
+
+        OPACITY_THRESHOLD = 0.8
+        
+        # Stage1
         for gaussian_id, splat_visibility_in_cams in tqdm(enumerate(splat_camera_correspondence), total=num_gaussians):
-            masks = []  # contains triples of sam_mask and  its id and its corresponding render
+            masks = []  # contains triples of (camera_idx, sam_mask_tensor, rendered_ids_array)
+            
+            # Collect mask data before updating
             for i, camera in enumerate(cameras):
                 if splat_visibility_in_cams[i]:
+                    if gaussians.get_opacity[gaussian_id] < OPACITY_THRESHOLD:
+                        continue  # skip unreliable gaussians
+
                     rendered_image, _, _, _ = render_single_gaussian(camera, gaussians, gaussian_id, use_view_inv_white_shs=True)
                     rendered_image = fix_image(rendered_image)  # Convert to proper format
                     non_black_mask = np.any(rendered_image != 0, axis=2)
@@ -1647,16 +1700,55 @@ class MultiViewSAMMaskRefiner:
                     most_dominant_id = self._get_most_common_id_in_mask_weighted(sam_mask=sam_masks[i][sam_level], weight_matrix=weights_mask)
 
                     if not non_black_mask.any():
-                        # print("Nothing rendered. Skipping...")
                         continue
                     
-                    # Fix the mask extraction - get the SAM mask channel first
-                    sam_mask_channel = sam_masks[i][sam_level].cpu().numpy()  # [H, W]
-                    rendered_ids = sam_mask_channel * non_black_mask.astype(int)  # Fixed: use multiplication
+                    # Get the CURRENT state of refined masks (before this update)
+                    sam_mask_channel = refined_masks[i][sam_level].cpu().numpy()
+                    rendered_ids = sam_mask_channel * non_black_mask.astype(int)
 
-                    masks.append((i, sam_masks[i][sam_level], rendered_ids))
+                    masks.append((i, refined_masks[i][sam_level], most_dominant_id))
 
-            refined_masks_ = self.update_masks(gaussian_id, masks, sam_level)
-                    
+            # Update refined_masks with the result from update_masks
+            refined_masks = self.update_masks(gaussian_id, masks, refined_masks, sam_level)
+
+            # AFTER updating, collect visualization data for the first Gaussian
+            if True:
+                for i, camera in enumerate(cameras):
+                    if splat_visibility_in_cams[i]:
+                        # Re-render to get fresh data
+                        rendered_image, _, _, _ = render_single_gaussian(camera, gaussians, gaussian_id)
+                        rendered_image = fix_image(rendered_image)
+                        non_black_mask = np.any(rendered_image != 0, axis=2)
+
+                        if not non_black_mask.any():
+                            continue
+                        
+                        # Get the UPDATED state of refined masks (after this update)
+                        sam_mask_channel_after = refined_masks[i][sam_level].cpu().numpy()
+                        rendered_ids_after = sam_mask_channel_after * non_black_mask.astype(int)
+
+                        first_gaussian_viz_data.append({
+                            'camera': camera,
+                            'camera_idx': i,
+                            'rendered_ids': rendered_ids_after,  # Use AFTER data
+                            'sam_mask_channel': sam_mask_channel_after,  # Use AFTER data
+                            'rendered_image': rendered_image,
+                            'non_black_mask': non_black_mask
+                        })
+
+            # Visualize for the first Gaussian with UPDATED data
+            if first_gaussian_viz_data:
+                print(f"\nVisualizing refined masks for Gaussian 0 (AFTER updates):")
+                for viz_data in first_gaussian_viz_data:
+                    self.plot_masks(
+                        viz_data['camera'],
+                        viz_data['rendered_ids'],
+                        0,  # gaussian_id = 0
+                        viz_data['sam_mask_channel'],
+                        viz_data['rendered_image'],
+                        viz_data['non_black_mask'],
+                        viz_data['camera_idx'],
+                        original_sam_masks
+                    )
 
         return refined_masks
