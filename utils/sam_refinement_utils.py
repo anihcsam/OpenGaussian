@@ -54,6 +54,12 @@ def rgb_to_weight_map(rendered_image: torch.Tensor) -> torch.Tensor:
     # Convert to torch tensor if it's numpy
     if isinstance(rendered_image, np.ndarray):
         rendered_image = torch.from_numpy(rendered_image).float()
+        # Move to GPU if available
+        if torch.cuda.is_available():
+            rendered_image = rendered_image.cuda()
+    
+    # Ensure it's on the same device as the input if it was already a tensor
+    original_device = rendered_image.device
     
     # Normalize to 0-1 if needed
     if rendered_image.max() > 1.0:
@@ -67,8 +73,8 @@ def rgb_to_weight_map(rendered_image: torch.Tensor) -> torch.Tensor:
     if max_val > 0:  # Avoid division by zero
         weight_map = weight_map / max_val
     
-    # Add singleton dimension to get [H, W, 1]
-    weight_map = weight_map.unsqueeze(2)
+    # Add singleton dimension to get [H, W, 1] and ensure it's on the same device
+    weight_map = weight_map.unsqueeze(2).to(original_device)
     
     return weight_map
 
@@ -1398,7 +1404,7 @@ class MultiViewSAMMaskRefiner:
     
     def _get_most_common_id_in_mask_weighted(self, sam_mask: torch.Tensor, weight_matrix: torch.Tensor) -> int:
         """
-        Find the most dominant ID in an image based on weighted counts.
+        Find the most dominant ID in an image based on weighted counts using GPU parallelization.
         
         Args:
             sam_mask: torch.Tensor with shape [H, W] containing ID values
@@ -1407,34 +1413,48 @@ class MultiViewSAMMaskRefiner:
         Returns:
             int: The ID with the highest weighted sum
         """
-        # Flatten both tensors for easier processing
+        # Ensure both tensors are on the same device
+        device = sam_mask.device
+        if weight_matrix.device != device:
+            weight_matrix = weight_matrix.to(device)
+        
+        # Ensure weight_matrix has the right shape [H, W] (squeeze if needed)
+        if weight_matrix.ndim == 3 and weight_matrix.shape[2] == 1:
+            weight_matrix = weight_matrix.squeeze(2)
+        
+        # Flatten both tensors
         sam_mask_flat = sam_mask.flatten()
         weights_flat = weight_matrix.flatten()
         
-        # Create a dictionary to accumulate weighted counts
-        weighted_counts = {}
+        # Find min and max IDs to handle negative values
+        min_id = sam_mask_flat.min().item()
+        max_id = sam_mask_flat.max().item()
         
-        # Accumulate weights for each ID
-        for id_val, weight in zip(sam_mask_flat, weights_flat):
-            id_key = id_val.item()  # Convert tensor to Python int
-            weight_val = weight.item()  # Convert tensor to Python float
-            
-            if id_key not in weighted_counts:
-                weighted_counts[id_key] = 0.0
-            weighted_counts[id_key] += weight_val
+        if min_id == max_id:
+            return int(min_id)  # All pixels have the same ID
+        
+        # Shift IDs to make them non-negative for bincount
+        # This allows us to handle negative IDs like -1
+        offset = -min_id if min_id < 0 else 0
+        shifted_ids = sam_mask_flat + offset
+        
+        # Use bincount to accumulate weights - this is GPU parallelized!
+        weighted_counts = torch.bincount(shifted_ids.long(), weights=weights_flat, 
+                                    minlength=int(max_id + offset) + 1)
         
         # Find the ID with maximum weighted count
-        if not weighted_counts:
-            return -100  # No valid IDs
+        most_common_shifted_id = torch.argmax(weighted_counts).item()
         
-        most_common_id = max(weighted_counts, key=weighted_counts.get)
-        max_weight = weighted_counts[most_common_id]
+        # Shift back to original ID space
+        most_common_id = most_common_shifted_id - offset
+        max_weight = weighted_counts[most_common_shifted_id].item()
         
         if self.log_to_rerun:
-            print(f"Most dominant ID: {most_common_id} with weighted count: {max_weight:.3f}"
-                f"\n keys {weighted_counts.keys()}")
-        return most_common_id
-    
+            print(f"Most dominant ID: {most_common_id} with weighted count: {max_weight:.3f}")
+            
+        return int(most_common_id)
+
+
     def _get_most_common_id_in_mask(self, image: torch.Tensor, mask: torch.Tensor, channel: int = 0) -> int:
         """
         Given an image [C, H, W] and a binary mask [H, W], return the most common ID
@@ -1524,10 +1544,10 @@ class MultiViewSAMMaskRefiner:
         plt.show()
 
         # Print info
-        unique_sam_ids = np.unique(sam_mask_channel[sam_mask_channel > 0])
-        unique_rendered_ids = np.unique(rendered_ids[rendered_ids > 0])
-        unique_original_ids = np.unique(original_img[original_img > 0])
-        unique_refined_ids = np.unique(refined_img[refined_img > 0])
+        unique_sam_ids = np.unique(sam_mask_channel[sam_mask_channel > -100], return_counts=True)
+        unique_rendered_ids = np.unique(rendered_ids[rendered_ids > -100], return_counts=True )
+        unique_original_ids = np.unique(original_img[original_img > -100], return_counts=True)
+        unique_refined_ids = np.unique(refined_img[refined_img > -100], return_counts=True)
         
         print(f"Gaussian {gaussian_id}, Camera {camera_idx}:")
         print(f"  Original SAM mask unique IDs: {unique_original_ids}")
@@ -1682,11 +1702,11 @@ class MultiViewSAMMaskRefiner:
         first_gaussian_viz_data = []
 
         OPACITY_THRESHOLD = 0.8
-        
+        from time import time
         # Stage1
         for gaussian_id, splat_visibility_in_cams in tqdm(enumerate(splat_camera_correspondence), total=num_gaussians):
             masks = []  # contains triples of (camera_idx, sam_mask_tensor, rendered_ids_array)
-            
+            begin = time()
             # Collect mask data before updating
             for i, camera in enumerate(cameras):
                 if splat_visibility_in_cams[i]:
@@ -1710,9 +1730,10 @@ class MultiViewSAMMaskRefiner:
 
             # Update refined_masks with the result from update_masks
             refined_masks = self.update_masks(gaussian_id, masks, refined_masks, sam_level)
-
+            end = time()
+            print(f"Time: {end - begin} s")
             # AFTER updating, collect visualization data for the first Gaussian
-            if True:
+            if False:
                 for i, camera in enumerate(cameras):
                     if splat_visibility_in_cams[i]:
                         # Re-render to get fresh data
@@ -1737,13 +1758,13 @@ class MultiViewSAMMaskRefiner:
                         })
 
             # Visualize for the first Gaussian with UPDATED data
-            if first_gaussian_viz_data:
+            if False and first_gaussian_viz_data:
                 print(f"\nVisualizing refined masks for Gaussian 0 (AFTER updates):")
                 for viz_data in first_gaussian_viz_data:
                     self.plot_masks(
                         viz_data['camera'],
                         viz_data['rendered_ids'],
-                        0,  # gaussian_id = 0
+                        gaussian_id,
                         viz_data['sam_mask_channel'],
                         viz_data['rendered_image'],
                         viz_data['non_black_mask'],
