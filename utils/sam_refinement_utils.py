@@ -1983,7 +1983,7 @@ class MultiViewSAMMaskRefiner:
         # Init pixel lookup tables
         start_time = time.time()
         for i, camera in enumerate(cameras):
-            if refined_masks[i][sam_level] is None:
+            if refined_masks[i] is None:
                 continue
             
             device = refined_masks[i][sam_level].device
@@ -2000,6 +2000,17 @@ class MultiViewSAMMaskRefiner:
             # This replaces the nested dictionary structure
             camera.pixel_value_tensor = torch.full((H, W, num_ids), 0.0, 
                                         dtype=torch.float32, device=device)
+            
+            # Initialize counts of IDs of pixels in refined_masks to 1.0
+            for id_val, idx in camera.id_to_idx.items():
+                # Skip initialization for invalid/background ID
+                if id_val == -1:
+                    continue
+                
+                # Set pixels that belong to this ID to 1.0
+                mask_for_id = (refined_masks[i][sam_level] == id_val)
+                y_indices, x_indices = torch.where(mask_for_id)
+                camera.pixel_value_tensor[y_indices, x_indices, idx] = 1.0
             
             camera.id_range = (camera.unique_ids.min().item(), camera.unique_ids.max().item())
             
