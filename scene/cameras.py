@@ -79,6 +79,17 @@ class Camera(nn.Module):
         self.intrinsic_matrix = getCameraToPixelMatrix(
             self.image_width, self.image_height, self.FoVx, self.FoVy, self.cx, self.cy)
         
+        # Attribute to estimate visible splats
+        self.depth_map = None
+        
+        # Pixel lookup table attributes
+        self.unique_ids = None
+        # Structure of shape H,W,num_ids holding aggregated count for each channel as for each ID (map is self.id_to_idx)
+        self.pixel_value_tensor = None
+        self.id_to_idx = None
+        # self.idx_to_id = None
+        self.id_range = None
+        
     # modify -----
     def to_gpu(self):
         for attr_name in dir(self):
