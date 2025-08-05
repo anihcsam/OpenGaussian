@@ -155,7 +155,7 @@ def separation_loss(feat_mean_stack, iteration):
     return loss
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, \
-             checkpoint, debug_from, enable_multiview_refinement=False, log_to_rerun=False, visualize_matches=False, vote_collection_strategy="projection"):
+             checkpoint, debug_from, enable_multiview_refinement=False, verbose_logging=False):
     iterations = [opt.start_ins_feat_iter, opt.start_leaf_cb_iter, opt.start_root_cb_iter]
     saving_iterations.extend(iterations)
     checkpoint_iterations.extend(iterations)
@@ -408,24 +408,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     cameras_to_refine.append(view)
             
             # Apply multi-view refinement
-            refiner = MultiViewSAMMaskRefiner(overlap_threshold=0.3, consensus_strategy="majority_vote",
-                                              log_to_rerun=log_to_rerun, visualize_matches=visualize_matches, vote_collection_strategy=vote_collection_strategy)
-            
-            # Disable vectorization when logging
-            if log_to_rerun or visualize_matches:
-                refined_sam_masks = refiner.refine_sam_masks_multistage(
-                    cameras_to_refine, 
-                    original_sam_masks, 
-                    scene.gaussians, 
-                    sam_level=sam_level
-                )
-            else:
-                refined_sam_masks = refiner.refine_sam_masks_multistage(
-                    cameras_to_refine, 
-                    original_sam_masks, 
-                    scene.gaussians, 
-                    sam_level=sam_level
-                )
+            refiner = MultiViewSAMMaskRefiner(verbose_logging=verbose_logging)
+            refined_sam_masks = refiner.refine_sam_masks(
+                cameras_to_refine, 
+                original_sam_masks, 
+                scene.gaussians, 
+                sam_level=sam_level
+            )
             
             # Update cameras with refined masks
             for i, view in enumerate(scene.getTrainCameras()):
@@ -1054,9 +1043,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--enable_multiview_sam_refinement", action="store_true", default=False, 
                        help="Enable multi-view SAM mask refinement for consistency")
-    parser.add_argument("--log_to_rerun", action="store_true")
-    parser.add_argument("--visualize_matches", action="store_true")
-    parser.add_argument("--vote_collection_strategy", type=str, default = None)
+    parser.add_argument("--verbose_logging", action="store_true")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     args.checkpoint_iterations.append(args.iterations)
@@ -1071,7 +1058,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), \
              args.test_iterations, args.save_iterations, args.checkpoint_iterations, \
-             args.start_checkpoint, args.debug_from, args.enable_multiview_sam_refinement, args.log_to_rerun, args.visualize_matches, args.vote_collection_strategy)
+             args.start_checkpoint, args.debug_from, args.enable_multiview_sam_refinement, args.verbose_logging)
 
     # All done
     print("\nTraining complete.")

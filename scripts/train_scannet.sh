@@ -30,7 +30,7 @@ scan_list=("scene0062_00_sam2_l")
 gpu_num=0     # change!
 for scan in "${scan_list[@]}"; do
     echo "Training for ${scan} ....."
-    CUDA_VISIBLE_DEVICES=$gpu_num python train_refined_sam_masks.py --port 601$gpu_num \
+    CUDA_VISIBLE_DEVICES=$gpu_num python train.py --port 601$gpu_num \
         -s ../data/scannet_preprocessed/scans/${scan} \
         -r 2 \
         --frozen_init_pts \
@@ -45,7 +45,7 @@ for scan in "${scan_list[@]}"; do
         --test_iterations 30000 \
         --eval \
         --enable_multiview_sam_refinement \
-        --start_checkpoint /home/andrii/TUM/ml3dg/project/OpenGaussian/output/scene0062_00_sam2_l_refined/chkpnt50000.pth
+        --start_checkpoint ./checkpoints/chkpnt30000.pth # \
+        # --verbose_logging
 done
-
         # --start_checkpoint /home/andrii/TUM/ml3dg/project/OpenGaussian/output/scene0062_00_sam2_l/chkpnt30000.pth
