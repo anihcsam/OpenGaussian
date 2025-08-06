@@ -23,13 +23,13 @@ from ashawkey_diff_gaussian_rasterization import (
 # Utils
 
 
-def save_weight_map_to_csv(weight_map: torch.Tensor, filename="weight_map.csv"):
+def save_weight_map_to_csv(weight_map: torch.Tensor, filename: str = "weight_map.csv"):
     """
     Save a weight map to a CSV file.
 
     Args:
-        weight_map: Weight map with shape [H, W, 1] or [H, W] as torch.Tensor
-        filename: Output CSV filename
+        weight_map (torch.Tensor): Weight map with shape [H, W, 1] or [H, W] as torch.Tensor
+        filename (str): Output CSV filename
     """
     # Convert to numpy if it's a torch tensor
     if isinstance(weight_map, torch.Tensor):
@@ -50,7 +50,7 @@ def fix_image(rendered_image: torch.Tensor) -> torch.Tensor:
     Fix image format for vizualisation.
 
     Args:
-        rendered_image: torch.Tensor in various formats
+        rendered_image (torch.Tensor): in various formats
 
     Returns:
         torch.Tensor: Fixed image in [H, W, 3] format with uint8 dtype
@@ -83,10 +83,10 @@ def mat_to_quat(matrix: torch.Tensor) -> torch.Tensor:
     Convert rotations given as rotation matrices to quaternions.
 
     Args:
-        matrix: Rotation matrices as tensor of shape (..., 3, 3).
+        matrix (torch.Tensor): Rotation matrices as tensor of shape (..., 3, 3).
 
     Returns:
-        quaternions with real part last, as tensor of shape (..., 4).
+        torch.Tensor: quaternions with real part last, as tensor of shape (..., 4).
         Quaternion Order: XYZW or say ijkr, scalar-last
     """
 
@@ -188,12 +188,12 @@ def log_camera_pose(
     Log camera (pose + intrinsics) into rerun viewer.
 
     Args:
-        log_name - rerun space to append camera pose to (e.g. same as pcl space name)
-        translation - 1x3 translation vector
-        rotation_q - 1x4 rotation vector (quaternion)
-        intrinsics - 3x3 K matrix
-        frame_width, frame_height - image res
-        image - image to place inside of a frustum
+        log_name (str): rerun space to append camera pose to (e.g. same as pcl space name)
+        translation (np.ndarray): 1x3 translation vector
+        rotation_q (np.ndarray): 1x4 rotation vector (quaternion)
+        intrinsics (np.ndarray): 3x3 K matrix
+        frame_width, frame_height (int): image resolution
+        image (np.ndarray): image to place inside of a frustum
     """
 
     # Camera pose
@@ -247,10 +247,10 @@ class MultiViewSAMMaskRefiner:
         (assuming that a single splat with white viewpoint-invariant color is rendered).
 
         Args:
-            rendered_image: RGB image with shape [H, W, 3]
+            rendered_image (torch.Tensor): RGB image with shape [H, W, 3]
 
         Returns:
-            weight_map: Single channel weight map with shape [H, W, 1] as torch.Tensor
+            weight_map (torch.Tensor): Single channel weight map with shape [H, W, 1] as torch.Tensor
         """
 
         original_device = rendered_image.device
@@ -282,7 +282,7 @@ class MultiViewSAMMaskRefiner:
         across all masks.
 
         Args:
-            masks: List of masks, each with shape [H, W] containing segment IDs
+            masks (list): List of masks, each with shape [H, W] containing segment IDs
 
         Returns:
             tuple: (id_mapping dict, remapped_masks list)
@@ -345,8 +345,7 @@ class MultiViewSAMMaskRefiner:
         Gaussian for individual rendering to analyze its contribution to the scene.
 
         Args:
-            viewpoint_camera (Camera): Camera object containing view parameters and transformations
-            pc (GaussianModel): The Gaussian model containing all splats
+            cam_idx (int): Index of the camera to use for rendering
             gaussian_idx (int): Index of the specific Gaussian to render (0-based)
             scaling_modifier (float, optional): Scaling factor applied to Gaussian sizes. Defaults to 1.0
             use_view_inv_white_shs (bool, optional): If True, uses view-invariant white spherical harmonics
@@ -436,12 +435,16 @@ class MultiViewSAMMaskRefiner:
         Render all Gaussians except those specified in exclude_indices.
         If exclude_indices is empty or None, render all Gaussians.
 
+        This method is inspired by gaussian_renderer.render method.
+
         Args:
-            viewpoint_camera: Camera object.
-            pc (GaussianModel): Gaussian model.
-            exclude_indices (list or None): Indices to exclude from rendering.
-            scaling_modifier (float): Scaling modifier for rendering.
-            kwargs: Additional arguments.
+            cam_idx (int): Index of the camera to use for rendering
+            exclude_indices (list or None, optional): List of Gaussian indices to exclude
+                from rendering. If None or empty, renders all Gaussians. Defaults to None.
+            scaling_modifier (float, optional): Scaling factor applied to Gaussian sizes
+                during rasterization. Defaults to 1.0.
+            **kwargs: Additional keyword arguments passed to the rasterizer, including:
+                - override_color: Optional color override for rendered Gaussians
 
         Returns:
             rendered_image, radii, rendered_depth, rendered_alpha
@@ -516,16 +519,7 @@ class MultiViewSAMMaskRefiner:
         self, point_3d, camera: Camera, index_gs=0, index_cam=0
     ):
         """
-        Project 3D point in world coordinates into 2D image pixel coordinates.
-
-        Parameters:
-        - points_3d (torch.Tensor): A tensor of shape (3) representing point in world coordinates.
-        - world_to_camera (torch.Tensor): A 4x4 transformation matrix mapping world coordinates to camera coordinates.
-        - camera_to_pixel (torch.Tensor): A 4x4 transformation matrix mapping camera coordinates to pixel coordinates.
-
-        Returns:
-        - u,v.
-        - flag visible or not
+        Original version of project_3d_points_to_image_batch for a single point (not up-to-date).
         """
 
         # Convert points to homogeneous coordinates (add a fourth '1' coordinate)
@@ -564,17 +558,28 @@ class MultiViewSAMMaskRefiner:
         self, cam_idx: int, gaussian_indices=None, use_depth=False
     ):
         """
-        Project batch of 3D points in world coordinates into 2D image pixel coordinates.
+        Project batch of 3D Gaussian points from world space to camera space and determine visibility.
 
-        Parameters:
-        - points_3d (torch.Tensor): A tensor of shape (N, 3) representing points in world coordinates.
-        - camera (Camera): Camera object
-        - gaussian_indices: indices for logging (optional)
-        - index_cam: camera index for logging
+        This method transforms 3D Gaussian points from world space to camersa pixel coords and determines
+        visibility by comparing an euclidean distance to the point in 3D space to the rendered depth.
+
+        Args:
+            cam_idx (int): Index of the camera to use for projection
+            gaussian_indices (array-like, optional): Indices of specific Gaussians to project.
+                If None, projects all Gaussians. Used for selective processing and logging.
+            use_depth (bool, optional): Whether to perform depth map validation for visibility
+                determination. When True, compares projected point depths with rendered depth map
+                values using a configurable threshold (DEPTH_DIFF_THRESHOLD = 0.15m). Defaults to False.
 
         Returns:
-        - u, v (torch.Tensor): pixel coordinates of shape (N,) each
-        - visible (torch.Tensor): boolean mask of shape (N,) indicating visibility
+            tuple: A 3-tuple containing:
+                - u (torch.Tensor): Pixel x-coordinates of shape (N,) where N is the number of points
+                - v (torch.Tensor): Pixel y-coordinates of shape (N,) where N is the number of points
+                - visible (torch.Tensor): Boolean mask of shape (N,) indicating which points are visible.
+                    Points are considered visible if they:
+                    - Are in front of the camera (z > 0 in camera space)
+                    - Fall within image bounds (0 <= u < width, 0 <= v < height)
+                    - Pass depth validation (if use_depth=True)
         """
 
         camera = self.cameras[cam_idx]
@@ -712,10 +717,10 @@ class MultiViewSAMMaskRefiner:
         self, sam_mask: torch.Tensor, weight_matrix: torch.Tensor
     ) -> int:
         """
-        Find the most dominant ID in an image based on weighted counts using GPU parallelization.
+        Find the most dominant ID in an image based on weighted counts.
 
         Args:
-            sam_mask: torch.Tensor with shape [H, W] containing ID values
+            sam_mask: torch.Tensor with shape [H, W]
             weight_matrix: torch.Tensor with shape [H, W] containing weights for each pixel
 
         Returns:
@@ -776,6 +781,10 @@ class MultiViewSAMMaskRefiner:
         orig_starting_idx: int = 0,
         orig_ending_idx: int = -1,
     ):
+        """
+        Method to aggregate results to vizualize.
+        """
+
         rr.init("Sam_Refinement_Multistage", spawn=True)
         rr.log(
             "world_frame",
@@ -907,6 +916,10 @@ class MultiViewSAMMaskRefiner:
         original_sam_masks,
         cam_num_for_rerun,
     ):
+        """
+        Method to vizualize results.
+        """
+
         PLOT_USING_MATPLOTLIB = False
 
         # Use the same color scheme as in train.py
@@ -1110,16 +1123,13 @@ class MultiViewSAMMaskRefiner:
         """
         Expands the splat region by identifying pixels with non-zero weights that are not part of the main object mask.
         Args:
-            weight_map (torch.Tensor): A tensor of shape [H, W] or [H, W, 1] representing the weight map (e.g., Gaussian splat).
-            object_mask (torch.Tensor): A boolean tensor of shape [H, W] indicating the main object segment.
+            weight_map (torch.Tensor): A tensor of shape [H, W] or [H, W, 1] representing the weight map of the splat).
+            object_mask (torch.Tensor): A boolean tensor of shape [H, W] indicating the object segment the splat relates to.
         Returns:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 - ext_y_indices (torch.Tensor): 1D tensor containing the y-coordinates of the extension pixels.
                 - ext_x_indices (torch.Tensor): 1D tensor containing the x-coordinates of the extension pixels.
                 - extension_weights (torch.Tensor): 1D tensor containing the weight values for the extension pixels.
-        Notes:
-            The function identifies pixels that are covered by the weight map but are not part of the main object mask,
-            and returns their coordinates and corresponding weights.
         """
 
         if weight_map.ndim == 3 and weight_map.shape[2] == 1:
@@ -1151,14 +1161,21 @@ class MultiViewSAMMaskRefiner:
         sam_level: int = 0,
     ):
         """
-        Create pixel-level ID-value mappings for each segmentation image using GPU parallelization.
+        Expand Gaussian splat masks across camera views using voting and weight-based extension.
+
+        This method determines the most dominant segment ID across multiple camera views through
+        voting, then expands the corresponding splat masks by updating pixel value tensors with
+        base mask counts and weighted extensions.
 
         Args:
-            gaussian_id: ID of the current Gaussian
-            sam_masks: List of segmentation tensors
-
-        Returns:
-            List of pixel maps with efficient tensor-based storage
+            gaussian_id (int): ID of the current Gaussian splat being processed
+            sam_masks (list[torch.Tensor]): List of SAM segmentation mask tensors for each camera view
+            cam_idx_splat_segment_id_weight_mask_pairs (list[tuple[int, int, torch.Tensor]]):
+                List of tuples containing:
+                - camera_idx (int): Index of the camera
+                - most_dominant_id (int): The dominant splat ID for this camera view
+                - weight_map (torch.Tensor): Weight map for splat expansion
+            sam_level (int, optional): Level/scale of SAM segmentation to use. Defaults to 0.
         """
 
         # Step 2: voting
@@ -1255,17 +1272,24 @@ class MultiViewSAMMaskRefiner:
         sam_level: int = 0,
     ) -> list[torch.Tensor]:
         """
-        Find the most common ID within the Gaussian's rendered footprint across all cameras,
-        then update ALL pixels with that ID to a new global ID for consistency.
+        Synchronize segment IDs across multiple camera views by assigning a new global ID.
+
+        This method finds the segment ID with the most weight within a Gaussian's rendered footprint
+        across all cameras and updates all pixels with that ID to a new globally unique ID
+        for consistency across views.
 
         Args:
-            gaussian_id: ID of the current Gaussian
-            cam_idx_splat_segment_id_pairs: list of tuples (camera_idx, most_dominant_id)
-            sam_masks: list of all SAM masks to be refined
-            sam_level: SAM level to use
+            gaussian_id (int): Unique identifier of the current Gaussian being processed
+            cam_idx_splat_segment_id_pairs (list[tuple[int, int]]): List of tuples containing
+                (camera_index, most_dominant_segment_id) pairs indicating which segment ID
+                is most dominant in each camera view
+            sam_masks (list[torch.Tensor]): List of SAM segmentation masks to be refined,
+                where each tensor corresponds to a camera view. Can contain None values
+                for cameras without masks
+            sam_level (int, optional): SAM hierarchy level to operate on. Defaults to 0
 
         Returns:
-            refined_masks: updated list of SAM masks
+            list[torch.Tensor]: Updated list of SAM masks with synchronized segment IDs.
         """
         if not cam_idx_splat_segment_id_pairs:
             return sam_masks  # No masks to process
@@ -1322,8 +1346,36 @@ class MultiViewSAMMaskRefiner:
         return refined_masks
 
     def refine_sam_masks(
-        self, cameras: list[Camera], sam_masks, gaussians, sam_level=0
-    ):
+        self,
+        cameras: list[Camera],
+        sam_masks: list[torch.Tensor],
+        gaussians: GaussianModel,
+        sam_level: int = 0,
+    ) -> list[torch.Tensor]:
+        """
+        Refines SAM (Segment Anything Model) masks using 3D Gaussian splatting for cross-view consistency.
+
+        This method performs a two-stage refinement process:
+        1. Stage 1: Achieves cross-view consistent object IDs by synchronizing segment IDs across cameras
+        2. Stage 2: Expands segment masks using rendered Gaussian splats to fill gaps and improve coverage
+
+        Args:
+            cameras (list[Camera]): List of camera objects containing pose and intrinsic parameters
+            sam_masks (list[torch.Tensor]): List of SAM segmentation masks for each camera view
+            gaussians (GaussianModel): 3D Gaussian splatting model containing point positions, opacities, etc.
+            sam_level (int, optional): Hierarchical level of SAM masks to process. Defaults to 0.
+
+        Returns:
+            list[torch.Tensor]: List of refined segmentation masks with improved cross-view consistency.
+
+        Process:
+            - Renders depth maps for each camera view
+            - Establishes splat-to-camera visibility correspondence
+            - Stage 1: Synchronizes segment IDs across views for high-opacity Gaussians (strided sampling)
+            - Stage 2: Expands masks by accumulating weights from all visible Gaussians
+            - Rewrites pixel segment IDs with values containing highest accumulated weights
+        """
+
         self.cameras = cameras
         self.gaussians = gaussians
 
