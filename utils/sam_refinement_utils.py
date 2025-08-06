@@ -780,6 +780,7 @@ class MultiViewSAMMaskRefiner:
         orig_stride: int = 1,
         orig_starting_idx: int = 0,
         orig_ending_idx: int = -1,
+        num_points_to_viz: int = 10,
     ):
         """
         Method to aggregate results to vizualize.
@@ -805,8 +806,8 @@ class MultiViewSAMMaskRefiner:
                 gaussian_indices[id].item() for id in strided_indices_orig
             ]
             if orig_ending_idx != -1:
-                gaussian_indices_orig_stride = gaussian_indices_orig_stride[
-                    :orig_ending_idx
+                gaussian_indices_orig_stride = [
+                    idx for idx in gaussian_indices_orig_stride if idx < orig_ending_idx
                 ]
             rr.log(
                 f"selected_splats",
@@ -817,10 +818,9 @@ class MultiViewSAMMaskRefiner:
                 ),
             )
 
-        NUM_POINTS_TO_CHECK = 10
         strided_indices = []
         for i in range(
-            0, len(gaussian_indices), len(gaussian_indices) // NUM_POINTS_TO_CHECK
+            0, len(gaussian_indices), len(gaussian_indices) // num_points_to_viz
         ):
             strided_indices.append(i)
         num_gaussians = self.gaussians.get_xyz.shape[0]
@@ -875,8 +875,8 @@ class MultiViewSAMMaskRefiner:
                 # print(f"Debug: gaussian id shifted {viz_data['gaussian_id']}")
                 if splat_id_prev_for_rerun != viz_data["gaussian_id"]:
                     input(
-                        f"{cam_number_for_rerun+1} frames in prev log. "
-                        f"Press to log results for splat|cam [{viz_data['gaussian_id']}|{viz_data['camera_idx']}]"
+                        f"{cam_number_for_rerun} frames in prev log. "
+                        f"Press to log results for splat {viz_data['gaussian_id']}"
                     )
                     cam_number_for_rerun = 0
                     splat_id_prev_for_rerun = viz_data["gaussian_id"]
@@ -1195,9 +1195,11 @@ class MultiViewSAMMaskRefiner:
 
         if id_vote_counts:
             winning_id = max(id_vote_counts, key=id_vote_counts.get)
-            # max_votes = id_vote_counts[winning_id]
+            max_votes = id_vote_counts[winning_id]
 
-            # print(f"Splat {gaussian_id}: winning ID: {winning_id} with {max_votes} votes out of {len(cam_idx_splat_segment_id_weight_mask_pairs)} cameras")
+            # print(
+            #     f"Splat {gaussian_id}: winning ID: {winning_id} with {max_votes} votes out of {len(cam_idx_splat_segment_id_weight_mask_pairs)} cameras"
+            # )
             # print(f"All vote counts: {id_vote_counts}")
 
             # Extend segments with projected splats
@@ -1207,38 +1209,50 @@ class MultiViewSAMMaskRefiner:
                 weight_map,
             ) in cam_idx_splat_segment_id_weight_mask_pairs:
                 if winning_id == most_dominant_id:
-                    object_mask_of_dominant_id = (
-                        sam_masks[camera_idx][sam_level] == winning_id
-                    )
-                    idx = self.cameras[camera_idx].id_to_idx[winning_id]
+                    # Skip expanding over -1 (void)
+                    if winning_id != -1:
+                        object_mask_of_dominant_id = (
+                            sam_masks[camera_idx][sam_level] == winning_id
+                        )
+                        idx = self.cameras[camera_idx].id_to_idx[winning_id]
 
-                    # Update count of base mask (s1)
-                    y_indices, x_indices = torch.where(object_mask_of_dominant_id)
-                    self.cameras[camera_idx].pixel_value_tensor[
-                        y_indices, x_indices, idx
-                    ] += 1.0
-                    # print(f"Cam {camera_idx} counts: \n{cameras[camera_idx].pixel_value_tensor[y_indices, x_indices, idx]}")
-
-                    # Expand splat over winning mask (s2)
-                    ext_y_indices, ext_x_indices, extension_weights = self.expand_splat(
-                        weight_map=weight_map, object_mask=object_mask_of_dominant_id
-                    )
-                    if (
-                        ext_y_indices is not None
-                        and ext_x_indices is not None
-                        and extension_weights is not None
-                    ):
+                        # Update count of base mask (s1)
+                        y_indices, x_indices = torch.where(object_mask_of_dominant_id)
                         self.cameras[camera_idx].pixel_value_tensor[
-                            ext_y_indices, ext_x_indices, idx
-                        ] += extension_weights
-                        # print(f"Extended {len(ext_y_indices)} pixels for winning_id {winning_id} with weights")
+                            y_indices, x_indices, idx
+                        ] += 1.0
+                        # print(
+                        #     f"Cam {camera_idx} counts: \n{self.cameras[camera_idx].pixel_value_tensor[y_indices, x_indices, idx]}"
+                        # )
+
+                        # Expand splat over winning mask (s2)
+                        ext_y_indices, ext_x_indices, extension_weights = (
+                            self.expand_splat(
+                                weight_map=weight_map,
+                                object_mask=object_mask_of_dominant_id,
+                            )
+                        )
+                        if (
+                            ext_y_indices is not None
+                            and ext_x_indices is not None
+                            and extension_weights is not None
+                        ):
+                            self.cameras[camera_idx].pixel_value_tensor[
+                                ext_y_indices, ext_x_indices, idx
+                            ] += extension_weights
+                            # print(
+                            #     f"Extended {len(ext_y_indices)} pixels for winning_id {winning_id} with weights"
+                            # )
                 else:
-                    continue
+                    # continue
                     # TODO: figure out whether this works
-                    # Check if winning_id is among image IDs
-                    if torch.any(
-                        self.cameras[camera_idx].unique_ids == winning_id
-                    ).item():
+                    # Check if winning_id is among image IDs and isn't equal to -1 (void)
+                    if (
+                        torch.any(
+                            self.cameras[camera_idx].unique_ids == winning_id
+                        ).item()
+                        and winning_id != -1
+                    ):
                         object_mask_of_dominant_id = (
                             sam_masks[camera_idx][sam_level] == winning_id
                         )
@@ -1376,8 +1390,27 @@ class MultiViewSAMMaskRefiner:
             - Rewrites pixel segment IDs with values containing highest accumulated weights
         """
 
+        num_gaussians = gaussians.get_xyz.shape[0]
+        gaussian_indices = range(0, num_gaussians, 1)
         self.cameras = cameras
         self.gaussians = gaussians
+
+        ### PARAMETERS ###
+        # Stage 1
+        STARTING_INDEX_STAGE_1 = 0
+        STRIDE_STAGE_1 = 250
+        OPACITY_THRESHOLD_STAGE_1 = 0.5
+        VIZUALIZE_STAGE_1 = False
+        NUM_POINTS_TO_VIZ_STAGE_1 = 10
+        # Stage 2
+        STARTING_INDEX_STAGE_2 = 9000
+        ENDING_INDEX_STAGE_2 = 10000  # len(gaussian_indices)
+        STRIDE_STAGE_2 = 1
+        # Minimal value of an accumulated weight in a pixel to overwrite it from void
+        THRESHOLD_ACCUMULATED_WEIGHT_STAGE_2 = 0.1
+        VIZUALIZE_STAGE_2 = True
+        NUM_POINTS_TO_VIZ_STAGE_2 = 10
+        ### END PARAMETERS ###
 
         # Initialize refined_masks as a copy of original sam_masks
         original_sam_masks = [
@@ -1398,8 +1431,6 @@ class MultiViewSAMMaskRefiner:
             )
             camera.depth_map = rendered_depth
 
-        num_gaussians = gaussians.get_xyz.shape[0]
-        gaussian_indices = range(0, num_gaussians, 1)
         splat_camera_correspondence = torch.empty(
             (
                 (
@@ -1454,9 +1485,6 @@ class MultiViewSAMMaskRefiner:
         )
 
         # Stage 1: get cross-view consistent object IDs
-        STARTING_INDEX_STAGE_1 = 0
-        STRIDE_STAGE_1 = 10
-        OPACITY_THRESHOLD_STAGE_1 = 0.0
         # TODO: consider add checking for variance ratio of principal axes
 
         # Filter out splats with low opacity
@@ -1529,8 +1557,7 @@ class MultiViewSAMMaskRefiner:
         print(f"Remapping:\n{id_mapping}")
 
         # VIZUALIZATION OF FIRST STAGE
-        VIZUALIZE = True
-        if VIZUALIZE:
+        if VIZUALIZE_STAGE_1:
             self.visualize_results(
                 original_sam_masks=original_sam_masks,
                 modified_sam_masks=refined_masks,
@@ -1539,6 +1566,7 @@ class MultiViewSAMMaskRefiner:
                 sam_level=sam_level,
                 orig_stride=STRIDE_STAGE_1,
                 orig_starting_idx=STARTING_INDEX_STAGE_1,
+                num_points_to_viz=NUM_POINTS_TO_VIZ_STAGE_1,
             )
 
         # Stage 2: expand splats
@@ -1563,9 +1591,6 @@ class MultiViewSAMMaskRefiner:
         print(f"Init duration pixel maps: {end_time - start_time}")
 
         # 2. Aggregate splat IDs and weights for mask expanding
-        STARTING_INDEX_STAGE_2 = 0
-        ENDING_INDEX_STAGE_2 = len(gaussian_indices)
-        STRIDE_STAGE_2 = 1
         strided_indices = []
         for i in range(STARTING_INDEX_STAGE_2, ENDING_INDEX_STAGE_2, STRIDE_STAGE_2):
             strided_indices.append(i)
@@ -1627,7 +1652,6 @@ class MultiViewSAMMaskRefiner:
         expanded_masks = [
             mask.clone() if mask is not None else None for mask in refined_masks
         ]
-        THRESHOLD_ACCUMULATED_WEIGHT = 0.5
         for i, camera in enumerate(cameras):
             # Get max accumulated values and respective tensor indices (channels)
             max_values, indices_with_max_counts = torch.max(
@@ -1639,14 +1663,13 @@ class MultiViewSAMMaskRefiner:
             # For initially 'void'-classified regions
             # (initialized to zero during weight accumulation)
             # only allow rewriting if accumulated weight is above certain threshold
-            below_threshold = max_values < THRESHOLD_ACCUMULATED_WEIGHT
+            below_threshold = max_values < THRESHOLD_ACCUMULATED_WEIGHT_STAGE_2
             expanded_mask[below_threshold] = -1
 
             expanded_masks[i][sam_level] = expanded_mask
 
         # VIZUALIZATION OF SECOND STAGE
-        VIZUALIZE = True
-        if VIZUALIZE:
+        if VIZUALIZE_STAGE_2:
             self.visualize_results(
                 original_sam_masks=refined_masks,
                 modified_sam_masks=expanded_masks,
@@ -1656,6 +1679,7 @@ class MultiViewSAMMaskRefiner:
                 orig_stride=STRIDE_STAGE_2,
                 orig_starting_idx=STARTING_INDEX_STAGE_2,
                 orig_ending_idx=ENDING_INDEX_STAGE_2,
+                num_points_to_viz=NUM_POINTS_TO_VIZ_STAGE_2,
             )
 
         return expanded_masks
