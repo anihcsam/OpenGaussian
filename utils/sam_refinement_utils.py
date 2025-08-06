@@ -1403,11 +1403,11 @@ class MultiViewSAMMaskRefiner:
         VIZUALIZE_STAGE_1 = False
         NUM_POINTS_TO_VIZ_STAGE_1 = 10
         # Stage 2
-        STARTING_INDEX_STAGE_2 = 9000
-        ENDING_INDEX_STAGE_2 = 10000  # len(gaussian_indices)
+        STARTING_INDEX_STAGE_2 = 0
+        ENDING_INDEX_STAGE_2 = len(gaussian_indices)
         STRIDE_STAGE_2 = 1
         # Minimal value of an accumulated weight in a pixel to overwrite it from void
-        THRESHOLD_ACCUMULATED_WEIGHT_STAGE_2 = 0.1
+        THRESHOLD_ACCUMULATED_WEIGHT_STAGE_2 = 0.5
         VIZUALIZE_STAGE_2 = True
         NUM_POINTS_TO_VIZ_STAGE_2 = 10
         ### END PARAMETERS ###
